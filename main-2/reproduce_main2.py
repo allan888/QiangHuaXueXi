@@ -502,6 +502,59 @@ class Alg4_ProposedQL_Dynamic(QLearningBase):
                       f"steps={steps}  reward={total_reward}")
 
 
+class SarsaStatic(QLearningBase):
+    """
+    SARSA 算法 (论文 Section 4.7, 对比算法之一)
+    State-Action-Reward-State-Action: On-policy TD 学习。
+
+    与 Q-learning 的关键区别:
+      Q-learning (off-policy):  Q(s,a) += α·[r + γ·max_a' Q(s',a') - Q(s,a)]
+      SARSA    (on-policy):   Q(s,a) += α·[r + γ·Q(s',a') - Q(s,a)]
+    其中 a' 是依据当前策略 (ε-greedy) 实际选取的下一个动作。
+
+    仅静态障碍物 (与其他对比算法一致)。
+    """
+
+    def train(self, verbose=True):
+        for ep in range(self.episodes):
+            state = self.env.reset()
+            gamma = self.get_gamma(ep)
+            total_reward = 0
+            steps = 0
+            max_steps = self.env.grid_size * 40
+
+            # 选择初始动作
+            action = self.choose_action_egreedy(state)
+
+            for _ in range(max_steps):
+                next_state, reward, done = self.env.step(action)
+                # 选择下一动作 a' (on-policy: 使用相同 ε-greedy)
+                next_action = self.choose_action_egreedy(next_state)
+
+                # SARSA 更新: 使用实际下一动作的 Q 值 (非 max)
+                td_target = reward + gamma * self.q_table[next_state[0], next_state[1], next_action]
+                td_error = td_target - self.q_table[state[0], state[1], action]
+                self.q_table[state[0], state[1], action] += self.alpha * td_error
+
+                self.replay_buffer.append((state, action, reward, next_state))
+
+                total_reward += reward
+                steps += 1
+                state = next_state
+                action = next_action
+
+                if done:
+                    break
+
+            self.experience_replay(gamma)
+            self.episode_steps.append(steps)
+            self.episode_rewards.append(total_reward)
+
+            if verbose and (ep + 1) % 500 == 0:
+                print(f"  SARSA                 Ep {ep+1}/{self.episodes}  "
+                      f"steps={steps}  reward={total_reward}")
+
+
 # ============================================================
 # 4. A* 和 Dijkstra 对比 (论文 Section 4.7)
 # ============================================================
@@ -584,11 +637,11 @@ def plot_env(ax, env, title="Environment"):
     for pos in env.dynamic_obstacles:
         grid[pos] = 2
 
-    cmap = ListedColormap(['white', 'dimgray', 'red'])
+    cmap = ListedColormap(['white', 'royalblue', 'red'])
     ax.imshow(grid.T, origin='lower', cmap=cmap, vmin=-0.5, vmax=2.5)
-    ax.plot(env.start[0], env.start[1], 'o', color='royalblue',
-            markersize=10, markeredgecolor='black', label='Start (UAV)')
-    ax.plot(env.goal[0], env.goal[1], 's', color='gold',
+    ax.plot(env.start[0], env.start[1], 'o', color='red',
+            markersize=10, markeredgecolor='black', label='UAV (Start)')
+    ax.plot(env.goal[0], env.goal[1], 's', color='yellow',
             markersize=10, markeredgecolor='black', label='Goal')
     ax.set_xlim(-0.5, g - 0.5)
     ax.set_ylim(-0.5, g - 0.5)
@@ -723,6 +776,25 @@ def main():
     print(f"  训练时间: {t1-t0:.2f}s  路径长度: {len(path4)}  "
           f"到达终点: {results['Alg4_ProposedQL_Dynamic']['success']}")
 
+    # ----- SARSA -----
+    print("\n>>> 对比算法: SARSA (仅静态障碍物)")
+    t0 = time.time()
+    env_sarsa = UAVEnvironment(grid_size=GRID_SIZE, n_dynamic=0, seed=SEED)
+    sarsa = SarsaStatic(env_sarsa, episodes=EPISODES, seed=SEED)
+    sarsa.train()
+    t1 = time.time()
+    path_sarsa = sarsa.get_path()
+    results['SARSA'] = {
+        'time': t1 - t0,
+        'train_steps': sarsa.episode_steps,
+        'train_rewards': sarsa.episode_rewards,
+        'path': path_sarsa,
+        'path_len': len(path_sarsa),
+        'success': len(path_sarsa) > 0 and path_sarsa[-1] == env_sarsa.goal,
+    }
+    print(f"  训练时间: {t1-t0:.2f}s  路径长度: {len(path_sarsa)}  "
+          f"到达终点: {results['SARSA']['success']}")
+
     # ----- A* & Dijkstra -----
     print("\n>>> 对比算法: A* 和 Dijkstra (仅静态障碍物)")
     env_static = UAVEnvironment(grid_size=GRID_SIZE, n_dynamic=0, seed=SEED)
@@ -754,7 +826,7 @@ def main():
     print("-" * 60)
     for name in ['Alg1_OriginalQL_Static', 'Alg2_OriginalQL_Dynamic',
                   'Alg3_ProposedQL_Static', 'Alg4_ProposedQL_Dynamic',
-                  'Astar', 'Dijkstra']:
+                  'Astar', 'Dijkstra', 'SARSA']:
         r = results[name]
         print(f" {name:<30} {r['time']:>8.2f}s {r['path_len']:>8}  "
               f"{'Yes' if r['success'] else 'No':>8}")
@@ -779,85 +851,141 @@ def main():
         dyn_results.append((n_dyn, env_tmp, p, ok))
 
     # ================================================================
-    # 生成图表
+    # 生成图表 (严格对照论文 Fig.4 ~ Fig.10)
     # ================================================================
     print("\n>>> 生成可视化图表...")
 
-    # --- Fig.1: 六种算法的路径对比 (对应论文 Fig.4 & Fig.5) ---
-    fig1, axes = plt.subplots(2, 3, figsize=(18, 13))
+    env_static_plot = UAVEnvironment(grid_size=GRID_SIZE, n_dynamic=0, seed=SEED)
+    w = max(1, EPISODES // 50)   # 收敛图平滑窗口
 
-    env_plot = UAVEnvironment(grid_size=GRID_SIZE, n_dynamic=0, seed=SEED)
+    # --- Fig.4: 四种 baseline 算法 (仅静态障碍物) ---
+    #     (a) A*, (b) Dijkstra, (c) SARSA, (d) Original Q-learning
+    fig4, ax4 = plt.subplots(2, 2, figsize=(12, 10))
 
-    plot_env(axes[0, 0], env_plot, "A*  (Static Only)")
-    plot_path_on(axes[0, 0], path_astar, color='orange', label='A* Path')
+    plot_env(ax4[0, 0], env_static_plot, "(a) A*")
+    plot_path_on(ax4[0, 0], path_astar, color='orange', label='A* Path')
 
-    plot_env(axes[0, 1], env_plot, "Dijkstra  (Static Only)")
-    plot_path_on(axes[0, 1], path_dij, color='cyan', label='Dijkstra Path')
+    plot_env(ax4[0, 1], env_static_plot, "(b) Dijkstra")
+    plot_path_on(ax4[0, 1], path_dij, color='cyan', label='Dijkstra Path')
 
-    plot_env(axes[0, 2], env1, "Alg1: Original QL + ε-greedy  (Static)")
-    plot_path_on(axes[0, 2], path1, color='lime', label='QL Path')
+    plot_env(ax4[1, 0], env_sarsa, "(c) SARSA")
+    plot_path_on(ax4[1, 0], path_sarsa, color='magenta', label='SARSA Path')
 
-    plot_env(axes[1, 0], env2, "Alg2: Original QL + ε-greedy  (Static + 2 Dyn)")
-    plot_path_on(axes[1, 0], path2, color='red', label='QL Path')
+    plot_env(ax4[1, 1], env1, "(d) Original Q-learning")
+    plot_path_on(ax4[1, 1], path1, color='lime', label='QL Path')
 
-    plot_env(axes[1, 1], env3, "Alg3: Proposed SDP-QL  (Static)")
-    plot_path_on(axes[1, 1], path3, color='lime', label='SDP-QL Path')
-
-    plot_env(axes[1, 2], env4, "Alg4: Proposed SDP-QL  (Static + 2 Dyn)")
-    plot_path_on(axes[1, 2], path4, color='lime', label='SDP-QL Path')
-
-    fig1.suptitle("Path Planning Comparison (Paper Fig.4 & Fig.5)",
-                  fontsize=14, fontweight='bold')
+    fig4.suptitle("Fig. 4: Path Planning with Static Obstacles (A*, Dijkstra, SARSA, Q-learning)",
+                  fontsize=13, fontweight='bold')
     plt.tight_layout()
-    fig1.savefig(OUTDIR + 'path_comparison.png', dpi=150, bbox_inches='tight')
-    plt.close(fig1)
-    print("  保存: path_comparison.png")
+    fig4.savefig(OUTDIR + 'Fig4_static_comparison.png', dpi=150, bbox_inches='tight')
+    plt.close(fig4)
+    print("  保存: Fig4_static_comparison.png")
 
-    # --- Fig.2: 四种QL算法的收敛曲线 (对应论文 Fig.6~Fig.10) ---
-    fig2, axes2 = plt.subplots(2, 2, figsize=(14, 10))
-    names_conv = [
-        ('Alg1: Original QL (Static)', results['Alg1_OriginalQL_Static']['train_steps']),
-        ('Alg2: Original QL (Static+2Dyn)', results['Alg2_OriginalQL_Dynamic']['train_steps']),
-        ('Alg3: Proposed SDP-QL (Static)', results['Alg3_ProposedQL_Static']['train_steps']),
-        ('Alg4: Proposed SDP-QL (Static+2Dyn)', results['Alg4_ProposedQL_Dynamic']['train_steps']),
-    ]
-    w = max(1, EPISODES // 50)
-    for idx, (title, data) in enumerate(names_conv):
-        ax = axes2.flat[idx]
-        ax.plot(data, alpha=0.15, color='steelblue', linewidth=0.5)
-        if len(data) >= w:
-            sm = np.convolve(data, np.ones(w) / w, mode='valid')
-            ax.plot(range(w - 1, len(data)), sm, color='darkblue',
-                    linewidth=2, label=f'MA({w})')
-        ax.set_title(title)
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Steps per Episode')
-        ax.grid(True, alpha=0.3)
-        ax.legend()
+    # --- Fig.5: 提出的算法在不同场景下的表现 ---
+    #     (a) Original QL + dynamic, (b) SDP-QL static, (c) SDP-QL + 2dyn, (d) SDP-QL + 4dyn
+    fig5, ax5 = plt.subplots(2, 2, figsize=(12, 10))
 
-    fig2.suptitle("Convergence Comparison (Paper Fig.6~Fig.10)",
-                  fontsize=14, fontweight='bold')
+    plot_env(ax5[0, 0], env2, "(a) Original QL + 2 Dyn. Obs.")
+    plot_path_on(ax5[0, 0], path2, color='red', label='QL Path')
+
+    plot_env(ax5[0, 1], env3, "(b) Proposed SDP-QL (Static Only)")
+    plot_path_on(ax5[0, 1], path3, color='lime', label='SDP-QL Path')
+
+    plot_env(ax5[1, 0], env4, "(c) Proposed SDP-QL + 2 Dyn. Obs.")
+    plot_path_on(ax5[1, 0], path4, color='lime', label='SDP-QL Path')
+
+    env_4dyn, path_4dyn = dyn_results[2][1], dyn_results[2][2]
+    plot_env(ax5[1, 1], env_4dyn, "(d) Proposed SDP-QL + 4 Dyn. Obs.")
+    plot_path_on(ax5[1, 1], path_4dyn, color='lime', label='SDP-QL Path')
+
+    fig5.suptitle("Fig. 5: Performance with Static and Dynamic Obstacles",
+                  fontsize=13, fontweight='bold')
     plt.tight_layout()
-    fig2.savefig(OUTDIR + 'convergence_comparison.png', dpi=150, bbox_inches='tight')
-    plt.close(fig2)
-    print("  保存: convergence_comparison.png")
+    fig5.savefig(OUTDIR + 'Fig5_dynamic_comparison.png', dpi=150, bbox_inches='tight')
+    plt.close(fig5)
+    print("  保存: Fig5_dynamic_comparison.png")
 
-    # --- Fig.3: 不同数量动态障碍物下SDP算法表现 (论文 Fig.9 & Fig.10) ---
-    fig3, axes3 = plt.subplots(1, 3, figsize=(18, 6))
-    for idx, (n_dyn, env_d, path_d, ok_d) in enumerate(dyn_results):
-        plot_env(axes3[idx], env_d,
-                 f"SDP-QL: {n_dyn} Dynamic Obstacle(s)  (len={len(path_d)})")
-        plot_path_on(axes3[idx], path_d, color='lime', label='SDP-QL Path')
+    # --- Fig.6: Original QL 收敛 (无动态障碍物) ---
+    fig6, ax6 = plt.subplots(figsize=(8, 4.5))
+    data6 = results['Alg1_OriginalQL_Static']['train_steps']
+    ax6.plot(data6, alpha=0.15, color='steelblue', linewidth=0.5)
+    if len(data6) >= w:
+        sm6 = np.convolve(data6, np.ones(w) / w, mode='valid')
+        ax6.plot(range(w - 1, len(data6)), sm6, color='darkblue',
+                 linewidth=2, label=f'Moving Average (w={w})')
+    ax6.set_title("Fig. 6: Original Q-learning — No Dynamic Obstacles")
+    ax6.set_xlabel('Episode'); ax6.set_ylabel('Steps per Episode')
+    ax6.grid(True, alpha=0.3); ax6.legend()
+    fig6.savefig(OUTDIR + 'Fig6_QL_static_convergence.png', dpi=150, bbox_inches='tight')
+    plt.close(fig6)
+    print("  保存: Fig6_QL_static_convergence.png")
 
-    fig3.suptitle("SDP-QL with Different Numbers of Dynamic Obstacles (Paper Fig.9 & Fig.10)",
-                  fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    fig3.savefig(OUTDIR + 'dynamic_obstacle_comparison.png', dpi=150,
-                 bbox_inches='tight')
-    plt.close(fig3)
-    print("  保存: dynamic_obstacle_comparison.png")
+    # --- Fig.7: Original QL 收敛 (有动态障碍物) ---
+    fig7, ax7 = plt.subplots(figsize=(8, 4.5))
+    data7 = results['Alg2_OriginalQL_Dynamic']['train_steps']
+    ax7.plot(data7, alpha=0.15, color='steelblue', linewidth=0.5)
+    if len(data7) >= w:
+        sm7 = np.convolve(data7, np.ones(w) / w, mode='valid')
+        ax7.plot(range(w - 1, len(data7)), sm7, color='darkblue',
+                 linewidth=2, label=f'Moving Average (w={w})')
+    ax7.set_title("Fig. 7: Original Q-learning — With Dynamic Obstacles")
+    ax7.set_xlabel('Episode'); ax7.set_ylabel('Steps per Episode')
+    ax7.grid(True, alpha=0.3); ax7.legend()
+    fig7.savefig(OUTDIR + 'Fig7_QL_dynamic_convergence.png', dpi=150, bbox_inches='tight')
+    plt.close(fig7)
+    print("  保存: Fig7_QL_dynamic_convergence.png")
 
-    print("\n完成! 图表已保存到 main-2 文件夹。")
+    # --- Fig.8: Proposed SDP-QL 收敛 (无动态障碍物) ---
+    fig8, ax8 = plt.subplots(figsize=(8, 4.5))
+    data8 = results['Alg3_ProposedQL_Static']['train_steps']
+    ax8.plot(data8, alpha=0.15, color='darkgreen', linewidth=0.5)
+    if len(data8) >= w:
+        sm8 = np.convolve(data8, np.ones(w) / w, mode='valid')
+        ax8.plot(range(w - 1, len(data8)), sm8, color='darkgreen',
+                 linewidth=2, label=f'Moving Average (w={w})')
+    ax8.set_title("Fig. 8: Proposed SDP-QL — No Dynamic Obstacles")
+    ax8.set_xlabel('Episode'); ax8.set_ylabel('Steps per Episode')
+    ax8.grid(True, alpha=0.3); ax8.legend()
+    fig8.savefig(OUTDIR + 'Fig8_SDP_static_convergence.png', dpi=150, bbox_inches='tight')
+    plt.close(fig8)
+    print("  保存: Fig8_SDP_static_convergence.png")
+
+    # --- Fig.9: Proposed SDP-QL 收敛 (2个动态障碍物) ---
+    fig9, ax9 = plt.subplots(figsize=(8, 4.5))
+    data9 = results['Alg4_ProposedQL_Dynamic']['train_steps']
+    ax9.plot(data9, alpha=0.15, color='darkgreen', linewidth=0.5)
+    if len(data9) >= w:
+        sm9 = np.convolve(data9, np.ones(w) / w, mode='valid')
+        ax9.plot(range(w - 1, len(data9)), sm9, color='darkgreen',
+                 linewidth=2, label=f'Moving Average (w={w})')
+    ax9.set_title("Fig. 9: Proposed SDP-QL — 2 Dynamic Obstacles")
+    ax9.set_xlabel('Episode'); ax9.set_ylabel('Steps per Episode')
+    ax9.grid(True, alpha=0.3); ax9.legend()
+    fig9.savefig(OUTDIR + 'Fig9_SDP_2dyn_convergence.png', dpi=150, bbox_inches='tight')
+    plt.close(fig9)
+    print("  保存: Fig9_SDP_2dyn_convergence.png")
+
+    # --- Fig.10: Proposed SDP-QL 收敛 (4个动态障碍物) ---
+    # 重新训练 SDP-QL + 4 动态障碍物以获取收敛数据
+    env_10 = UAVEnvironment(grid_size=GRID_SIZE, n_dynamic=4, seed=SEED)
+    alg_10 = Alg4_ProposedQL_Dynamic(env_10, episodes=EPISODES, seed=SEED)
+    alg_10.train(verbose=False)
+    data10 = alg_10.episode_steps
+
+    fig10, ax10 = plt.subplots(figsize=(8, 4.5))
+    ax10.plot(data10, alpha=0.15, color='darkgreen', linewidth=0.5)
+    if len(data10) >= w:
+        sm10 = np.convolve(data10, np.ones(w) / w, mode='valid')
+        ax10.plot(range(w - 1, len(data10)), sm10, color='darkgreen',
+                  linewidth=2, label=f'Moving Average (w={w})')
+    ax10.set_title("Fig. 10: Proposed SDP-QL — 4 Dynamic Obstacles")
+    ax10.set_xlabel('Episode'); ax10.set_ylabel('Steps per Episode')
+    ax10.grid(True, alpha=0.3); ax10.legend()
+    fig10.savefig(OUTDIR + 'Fig10_SDP_4dyn_convergence.png', dpi=150, bbox_inches='tight')
+    plt.close(fig10)
+    print("  保存: Fig10_SDP_4dyn_convergence.png")
+
+    print("\n完成! 图表 (Fig.4 ~ Fig.10) 已保存到 main-2 文件夹。")
 
 
 if __name__ == '__main__':
