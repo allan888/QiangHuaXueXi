@@ -1,117 +1,108 @@
 D:\Python3.12\python.exe D:\QiangHuaXueXi\main-2\reproduce_main2.py
-============================================================
-复现论文: Q-learning-based UAV Path Planning
-         with Dynamic Obstacle Avoidance
-============================================================
+=================================================================
+ 复现: Q-learning-based UAV Path Planning
+       with Dynamic Obstacle Avoidance
+ Amala Sonny et al., Applied Soft Computing 147 (2023)
+=================================================================
 
->>> Algorithm 1: 原始 Q-learning (仅静态障碍物)
-  [Alg1-静态QL] Episode 500/5000, steps=1, reward=-1.00
-  [Alg1-静态QL] Episode 1000/5000, steps=14, reward=-1.00
-  [Alg1-静态QL] Episode 1500/5000, steps=1, reward=-1.00
-  [Alg1-静态QL] Episode 2000/5000, steps=11, reward=-1.00
-  [Alg1-静态QL] Episode 2500/5000, steps=22, reward=1.00
-  [Alg1-静态QL] Episode 3000/5000, steps=28, reward=1.00
-  [Alg1-静态QL] Episode 3500/5000, steps=1, reward=-1.00
-  [Alg1-静态QL] Episode 4000/5000, steps=20, reward=1.00
-  [Alg1-静态QL] Episode 4500/5000, steps=24, reward=1.00
-  [Alg1-静态QL] Episode 5000/5000, steps=18, reward=1.00
-  训练时间: 1.59s, 路径长度: 19, 到达终点: True
+>>> Algorithm 1: 原始 Q-learning + ε-greedy (仅静态障碍物)
+  Alg1(QL+ε-greedy,静态) Ep 500/5000  steps=6  reward=-1
+  Alg1(QL+ε-greedy,静态) Ep 1000/5000  steps=8  reward=-1
+  Alg1(QL+ε-greedy,静态) Ep 1500/5000  steps=1  reward=-1
+  Alg1(QL+ε-greedy,静态) Ep 2000/5000  steps=1  reward=-1
+  Alg1(QL+ε-greedy,静态) Ep 2500/5000  steps=4  reward=-1
+  Alg1(QL+ε-greedy,静态) Ep 3000/5000  steps=3  reward=-1
+  Alg1(QL+ε-greedy,静态) Ep 3500/5000  steps=1  reward=-1
+  Alg1(QL+ε-greedy,静态) Ep 4000/5000  steps=11  reward=-1
+  Alg1(QL+ε-greedy,静态) Ep 4500/5000  steps=1  reward=-1
+  Alg1(QL+ε-greedy,静态) Ep 5000/5000  steps=2  reward=-1
+  训练时间: 1.25s  路径长度: 297  到达终点: True
 
->>> Algorithm 2: 原始 Q-learning (静态+2动态障碍物)
-  [Alg2-动态QL] Episode 500/5000, steps=6, reward=-1.00
-  [Alg2-动态QL] Episode 1000/5000, steps=1, reward=-1.00
-  [Alg2-动态QL] Episode 1500/5000, steps=18, reward=-1.00
-  [Alg2-动态QL] Episode 2000/5000, steps=1, reward=-1.00
-  [Alg2-动态QL] Episode 2500/5000, steps=18, reward=-1.00
-  [Alg2-动态QL] Episode 3000/5000, steps=2, reward=-1.00
-  [Alg2-动态QL] Episode 3500/5000, steps=24, reward=-1.00
-  [Alg2-动态QL] Episode 4000/5000, steps=23, reward=-1.00
-  [Alg2-动态QL] Episode 4500/5000, steps=9, reward=-1.00
-  [Alg2-动态QL] Episode 5000/5000, steps=2, reward=-1.00
-  训练时间: 2.12s, 路径长度: 7, 到达终点: False
+>>> Algorithm 2: 原始 Q-learning + ε-greedy (静态+2动态障碍物)
+  Alg2(QL+ε-greedy,动态) Ep 500/5000  steps=1  reward=-1
+  Alg2(QL+ε-greedy,动态) Ep 1000/5000  steps=1  reward=-1
+  Alg2(QL+ε-greedy,动态) Ep 1500/5000  steps=2  reward=-1
+  Alg2(QL+ε-greedy,动态) Ep 2000/5000  steps=1  reward=-1
+  Alg2(QL+ε-greedy,动态) Ep 2500/5000  steps=9  reward=-1
+  Alg2(QL+ε-greedy,动态) Ep 3000/5000  steps=5  reward=-1
+  Alg2(QL+ε-greedy,动态) Ep 3500/5000  steps=1  reward=-1
+  Alg2(QL+ε-greedy,动态) Ep 4000/5000  steps=4  reward=-1
+  Alg2(QL+ε-greedy,动态) Ep 4500/5000  steps=1  reward=-1
+  Alg2(QL+ε-greedy,动态) Ep 5000/5000  steps=1  reward=-1
+  训练时间: 1.25s  路径长度: 54  到达终点: False
 
 >>> Algorithm 3: 提出的 Q-learning + SDP (仅静态障碍物)
-  [Alg3-SDP静态] Episode 500/5000, steps=18, reward=1.00
-  [Alg3-SDP静态] Episode 1000/5000, steps=18, reward=1.00
-  [Alg3-SDP静态] Episode 1500/5000, steps=18, reward=1.00
-  [Alg3-SDP静态] Episode 2000/5000, steps=22, reward=1.00
-  [Alg3-SDP静态] Episode 2500/5000, steps=18, reward=1.00
-  [Alg3-SDP静态] Episode 3000/5000, steps=18, reward=1.00
-  [Alg3-SDP静态] Episode 3500/5000, steps=18, reward=1.00
-  [Alg3-SDP静态] Episode 4000/5000, steps=20, reward=1.00
-  [Alg3-SDP静态] Episode 4500/5000, steps=18, reward=1.00
-  [Alg3-SDP静态] Episode 5000/5000, steps=18, reward=1.00
-  训练时间: 1.75s, 路径长度: 19, 到达终点: True
+  Alg3(QL+SDP,静态)   Ep 500/5000  steps=48  reward=1
+  Alg3(QL+SDP,静态)   Ep 1000/5000  steps=48  reward=1
+  Alg3(QL+SDP,静态)   Ep 1500/5000  steps=48  reward=1
+  Alg3(QL+SDP,静态)   Ep 2000/5000  steps=48  reward=1
+  Alg3(QL+SDP,静态)   Ep 2500/5000  steps=48  reward=1
+  Alg3(QL+SDP,静态)   Ep 3000/5000  steps=48  reward=1
+  Alg3(QL+SDP,静态)   Ep 3500/5000  steps=48  reward=1
+  Alg3(QL+SDP,静态)   Ep 4000/5000  steps=48  reward=1
+  Alg3(QL+SDP,静态)   Ep 4500/5000  steps=48  reward=1
+  Alg3(QL+SDP,静态)   Ep 5000/5000  steps=48  reward=1
+  训练时间: 4.14s  路径长度: 49  到达终点: True
 
 >>> Algorithm 4: 提出的 Q-learning + SDP (静态+2动态障碍物)
-  [Alg4-SDP动态] Episode 500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 1000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 1500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 2000/5000, steps=22, reward=1.00
-  [Alg4-SDP动态] Episode 2500/5000, steps=24, reward=1.00
-  [Alg4-SDP动态] Episode 3000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 3500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 4000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 4500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 5000/5000, steps=20, reward=1.00
-  训练时间: 2.00s, 路径长度: 6, 到达终点: False
+  Alg4(QL+SDP,动态)   Ep 500/5000  steps=48  reward=1
+  Alg4(QL+SDP,动态)   Ep 1000/5000  steps=48  reward=1
+  Alg4(QL+SDP,动态)   Ep 1500/5000  steps=48  reward=1
+  Alg4(QL+SDP,动态)   Ep 2000/5000  steps=48  reward=1
+  Alg4(QL+SDP,动态)   Ep 2500/5000  steps=48  reward=1
+  Alg4(QL+SDP,动态)   Ep 3000/5000  steps=48  reward=1
+  Alg4(QL+SDP,动态)   Ep 3500/5000  steps=48  reward=1
+  Alg4(QL+SDP,动态)   Ep 4000/5000  steps=48  reward=1
+  Alg4(QL+SDP,动态)   Ep 4500/5000  steps=48  reward=1
+  Alg4(QL+SDP,动态)   Ep 5000/5000  steps=48  reward=1
+  训练时间: 4.78s  路径长度: 49  到达终点: True
 
->>> 对比算法: A* 和 Dijkstra
-  A*: 0.0002s, 路径长度: 19
-  Dijkstra: 0.0001s, 路径长度: 19
+>>> 对比算法: SARSA (仅静态障碍物)
+  SARSA                 Ep 500/5000  steps=1  reward=-1
+  SARSA                 Ep 1000/5000  steps=1  reward=-1
+  SARSA                 Ep 1500/5000  steps=3  reward=-1
+  SARSA                 Ep 2000/5000  steps=2  reward=-1
+  SARSA                 Ep 2500/5000  steps=1  reward=-1
+  SARSA                 Ep 3000/5000  steps=1  reward=-1
+  SARSA                 Ep 3500/5000  steps=3  reward=-1
+  SARSA                 Ep 4000/5000  steps=8  reward=-1
+  SARSA                 Ep 4500/5000  steps=1  reward=-1
+  SARSA                 Ep 5000/5000  steps=1  reward=-1
+  训练时间: 1.12s  路径长度: 201  到达终点: True
+
+>>> 对比算法: A* 和 Dijkstra (仅静态障碍物)
+  A*:       0.0009s  路径长度: 49
+  Dijkstra: 0.0007s  路径长度: 49
 
 ======================================================================
-性能汇总 (与论文 Table 2 对照)
+ 性能汇总 (对照论文 Table 2)
 ======================================================================
-算法                             训练时间(s)       最短路径      成功率
--------------------------------------------------------
-Alg1_QL_Static                  1.5944         19      Yes
-Alg2_QL_Dynamic                 2.1226          7       No
-Alg3_SDP_Static                 1.7505         19      Yes
-Alg4_SDP_Dynamic                1.9962          6       No
-Astar                           0.0002         19      Yes
-Dijkstra                        0.0001         19      Yes
+ 算法                                   训练时间     路径长度     到达终点
+------------------------------------------------------------
+ Alg1_OriginalQL_Static             1.25s      297       Yes
+ Alg2_OriginalQL_Dynamic            1.25s       54        No
+ Alg3_ProposedQL_Static             4.14s       49       Yes
+ Alg4_ProposedQL_Dynamic            4.78s       49       Yes
+ Astar                              0.00s       49       Yes
+ Dijkstra                           0.00s       49       Yes
+ SARSA                              1.12s      201       Yes
+
+ Alg1 (原始QL) 在 5000 轮训练中成功到达终点 0 次
+
+>>> SDP 算法在不同动态障碍物数量下的性能 (论文 Section 4.6):
+  SDP + 0动态障碍物:  4.03s  路径长度=49  到达终点=Yes
+  SDP + 2动态障碍物:  4.67s  路径长度=49  到达终点=Yes
+  SDP + 4动态障碍物:  5.17s  路径长度=49  到达终点=Yes
 
 >>> 生成可视化图表...
-  保存: path_comparison.png
-  保存: convergence_comparison.png
+  保存: Fig4_static_comparison.png
+  保存: Fig5_dynamic_comparison.png
+  保存: Fig6_QL_static_convergence.png
+  保存: Fig7_QL_dynamic_convergence.png
+  保存: Fig8_SDP_static_convergence.png
+  保存: Fig9_SDP_2dyn_convergence.png
+  保存: Fig10_SDP_4dyn_convergence.png
 
->>> 测试不同数量动态障碍物的 SDP 算法性能...
-  SDP + 0 动态障碍物...
-  [Alg4-SDP动态] Episode 500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 1000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 1500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 2000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 2500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 3000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 3500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 4000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 4500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 5000/5000, steps=18, reward=1.00
-  SDP + 2 动态障碍物...
-  [Alg4-SDP动态] Episode 500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 1000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 1500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 2000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 2500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 3000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 3500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 4000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 4500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 5000/5000, steps=18, reward=1.00
-  SDP + 4 动态障碍物...
-  [Alg4-SDP动态] Episode 500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 1000/5000, steps=20, reward=1.00
-  [Alg4-SDP动态] Episode 1500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 2000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 2500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 3000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 3500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 4000/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 4500/5000, steps=18, reward=1.00
-  [Alg4-SDP动态] Episode 5000/5000, steps=20, reward=1.00
-  保存: dynamic_obstacle_comparison.png
-
-完成!
+完成! 图表 (Fig.4 ~ Fig.10) 已保存到 main-2 文件夹。
 
 进程已结束，退出代码为 0
