@@ -334,6 +334,49 @@ class Alg1_OriginalQL_Static(QLearningBase):
                       f"steps={steps}  reward={total_reward}")
 
 
+class Alg2_OriginalQL_Dynamic(QLearningBase):
+    """
+    Algorithm 2: 原始 Q-learning + ε-greedy, 静态+动态障碍物。
+    用于与Alg4在相同动态环境下做时间对比。
+    """
+
+    def train(self, verbose=True):
+        for ep in range(self.episodes):
+            state = self.env.reset()
+            gamma = self.get_gamma(ep)
+            total_reward = 0
+            steps = 0
+            max_steps = self.env.grid_size * 40
+
+            for _ in range(max_steps):
+                action = self.choose_action_egreedy(state)
+                next_state, reward, done = self.env.step(action)
+
+                if (self.env.n_dynamic > 0
+                        and next_state in self.env.dynamic_obstacles):
+                    reward = -1
+                    done = True
+
+                self.update_q(state, action, reward, next_state, gamma)
+                total_reward += reward
+                steps += 1
+                state = next_state
+
+                if self.env.n_dynamic > 0:
+                    self.env.move_dynamic_obstacles()
+
+                if done:
+                    break
+
+            self.experience_replay(gamma)
+            self.episode_steps.append(steps)
+            self.episode_rewards.append(total_reward)
+
+            if verbose and (ep + 1) % 500 == 0:
+                print(f"  Alg2(QL+ε-greedy,动态) Ep {ep+1}/{self.episodes}  "
+                      f"steps={steps}  reward={total_reward}")
+
+
 class Alg4_ProposedQL_Dynamic(QLearningBase):
     """
     Algorithm 4: 提出的 Q-learning + SDP策略, 静态+动态障碍物。
@@ -471,6 +514,25 @@ def main():
     print(f"  训练时间: {t1-t0:.2f}s  路径长度: {len(path1)}  "
           f"到达终点: {results['Alg1_OriginalQL_Static']['success']}")
 
+    # ----- Alg2: 原始 QL + ε-greedy, 静态+2动态 (用于时间对比) -----
+    print("\n>>> Algorithm 2: 原始 Q-learning + ε-greedy (静态+2动态障碍物)")
+    t0 = time.time()
+    env2 = UAVEnvironment(grid_size=GRID_SIZE, n_dynamic=2, seed=SEED)
+    alg2 = Alg2_OriginalQL_Dynamic(env2, episodes=EPISODES, seed=SEED)
+    alg2.train()
+    t1 = time.time()
+    path2 = alg2.get_path()
+    results['Alg2_OriginalQL_Dynamic'] = {
+        'time': t1 - t0,
+        'train_steps': alg2.episode_steps,
+        'train_rewards': alg2.episode_rewards,
+        'path': path2,
+        'path_len': len(path2),
+        'success': len(path2) > 0 and path2[-1] == env2.goal,
+    }
+    print(f"  训练时间: {t1-t0:.2f}s  路径长度: {len(path2)}  "
+          f"到达终点: {results['Alg2_OriginalQL_Dynamic']['success']}")
+
     # ----- Alg4: 提出的 QL + SDP, 静态+2动态 -----
     print("\n>>> Algorithm 4: 提出的 Q-learning + SDP (静态+2动态障碍物)")
     t0 = time.time()
@@ -565,10 +627,11 @@ def main():
     plt.close(fig4)
     print("  保存: Fig4_Alg4_convergence.png")
 
-    # --- Fig5: 训练时间对比柱状图 ---
+    # --- Fig5: 训练时间对比 (同在静态+动态障碍物环境下) ---
     fig5, ax5 = plt.subplots(figsize=(6, 5))
-    names_bar = ['Alg1\n(Original QL\nStatic)', 'Alg4\n(SDP-QL\n2 Dyn. Obs.)']
-    times_bar = [results['Alg1_OriginalQL_Static']['time'],
+    names_bar = ['Q-Learning + ε-greedy\n(Static + 2 Dyn. Obs.)',
+                 'Q-Learning + SDP\n(Static + 2 Dyn. Obs.)']
+    times_bar = [results['Alg2_OriginalQL_Dynamic']['time'],
                  results['Alg4_ProposedQL_Dynamic']['time']]
     colors_bar = ['steelblue', 'darkgreen']
     bars = ax5.bar(names_bar, times_bar, color=colors_bar, edgecolor='black', width=0.5)
@@ -576,7 +639,7 @@ def main():
         ax5.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
                  f'{t:.2f}s', ha='center', va='bottom', fontsize=12, fontweight='bold')
     ax5.set_ylabel('Training Time (seconds)')
-    ax5.set_title('Fig.5: Training Time Comparison', fontsize=12, fontweight='bold')
+    ax5.set_title('Fig.5: Training Time Comparison (Same Environment)', fontsize=12, fontweight='bold')
     ax5.grid(True, alpha=0.3, axis='y')
     fig5.savefig(OUTDIR + 'Fig5_time_comparison.png', dpi=150, bbox_inches='tight')
     plt.close(fig5)
