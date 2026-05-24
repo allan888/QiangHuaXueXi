@@ -191,13 +191,14 @@ class QLearningBase:
     """
 
     def __init__(self, env, alpha=0.3, gamma_start=0.1, gamma_end=0.9,
-                 epsilon=0.9, episodes=5000, seed=None):
+                 epsilon=0.9, episodes=5000, step_penalty=0.0, seed=None):
         self.env = env
         self.alpha = alpha
         self.gamma_start = gamma_start
         self.gamma_end = gamma_end
         self.epsilon = epsilon
         self.episodes = episodes
+        self.step_penalty = step_penalty
         self.rng = np.random.RandomState(seed)
 
         g = env.grid_size
@@ -318,6 +319,7 @@ class Alg1_OriginalQL_Static(QLearningBase):
             for _ in range(max_steps):
                 action = self.choose_action_egreedy(state)
                 next_state, reward, done = self.env.step(action)
+                reward += self.step_penalty
                 self.update_q(state, action, reward, next_state, gamma)
                 total_reward += reward
                 steps += 1
@@ -351,6 +353,7 @@ class Alg2_OriginalQL_Dynamic(QLearningBase):
             for _ in range(max_steps):
                 action = self.choose_action_egreedy(state)
                 next_state, reward, done = self.env.step(action)
+                reward += self.step_penalty
 
                 if (self.env.n_dynamic > 0
                         and next_state in self.env.dynamic_obstacles):
@@ -480,13 +483,13 @@ def plot_convergence(data, title, ylabel, save_path, window=100):
 # 5. 主程序
 # ============================================================
 
-OUTDIR = 'D:\\QiangHuaXueXi\\Picture\\'
+OUTDIR = 'D:\\QiangHuaXueXi\\Result\\'
 
 
 def main():
     print("=" * 60)
     print(" Q-learning-based UAV Path Planning")
-    print(" Alg1: 原始QL+ε-greedy (静态)  vs  Alg4: SDP-QL (动态)")
+    print(" Alg2: QL+ε-greedy (静态+动态)  vs  Alg4: SDP-QL (静态+动态)")
     print("=" * 60)
 
     EPISODES = 5000
@@ -499,7 +502,8 @@ def main():
     print("\n>>> Algorithm 1: 原始 Q-learning + ε-greedy (仅静态障碍物)")
     t0 = time.time()
     env1 = UAVEnvironment(grid_size=GRID_SIZE, n_dynamic=0, seed=SEED)
-    alg1 = Alg1_OriginalQL_Static(env1, episodes=EPISODES, seed=SEED)
+    alg1 = Alg1_OriginalQL_Static(env1, episodes=EPISODES, epsilon=0.5,
+                                   alpha=0.4, step_penalty=-0.01, seed=SEED)
     alg1.train()
     t1 = time.time()
     path1 = alg1.get_path()
@@ -518,7 +522,8 @@ def main():
     print("\n>>> Algorithm 2: 原始 Q-learning + ε-greedy (静态+2动态障碍物)")
     t0 = time.time()
     env2 = UAVEnvironment(grid_size=GRID_SIZE, n_dynamic=2, seed=SEED)
-    alg2 = Alg2_OriginalQL_Dynamic(env2, episodes=EPISODES, seed=SEED)
+    alg2 = Alg2_OriginalQL_Dynamic(env2, episodes=EPISODES, epsilon=0.5,
+                                   alpha=0.4, step_penalty=-0.01, seed=SEED)
     alg2.train()
     t1 = time.time()
     path2 = alg2.get_path()
@@ -554,19 +559,19 @@ def main():
 
     # ----- 时间比对汇总 -----
     print("\n" + "=" * 60)
-    print(" 性能对比")
+    print(" QL+ε-greedy vs SDP-QL 对比 (同为静态+2动态障碍物)")
     print("=" * 60)
     print(f" {'算法':<35} {'训练时间':>10} {'路径长度':>8} {'到达终点':>8}")
     print("-" * 65)
-    for name in ['Alg1_OriginalQL_Static', 'Alg4_ProposedQL_Dynamic']:
+    for name in ['Alg2_OriginalQL_Dynamic', 'Alg4_ProposedQL_Dynamic']:
         r = results[name]
         print(f" {name:<35} {r['time']:>8.2f}s {r['path_len']:>8}  "
               f"{'Yes' if r['success'] else 'No':>8}")
 
-    # ----- 统计 Alg1 成功到达终点的轮次 -----
-    alg1_success_eps = [i for i, r in enumerate(results['Alg1_OriginalQL_Static']['train_rewards']) if r > 0]
+    # ----- 统计成功到达终点的轮次 -----
+    alg2_success_eps = [i for i, r in enumerate(results['Alg2_OriginalQL_Dynamic']['train_rewards']) if r > 0]
     alg4_success_eps = [i for i, r in enumerate(results['Alg4_ProposedQL_Dynamic']['train_rewards']) if r > 0]
-    print(f"\n Alg1 (原始QL)     在 {EPISODES} 轮训练中成功到达终点 {len(alg1_success_eps)} 次")
+    print(f"\n Alg2 (QL+ε-greedy) 在 {EPISODES} 轮训练中成功到达终点 {len(alg2_success_eps)} 次")
     print(f" Alg4 (SDP-QL)      在 {EPISODES} 轮训练中成功到达终点 {len(alg4_success_eps)} 次")
 
     # ================================================================
@@ -577,75 +582,82 @@ def main():
     os.makedirs(OUTDIR, exist_ok=True)
     w = max(1, EPISODES // 50)
 
-    # --- Fig1: Alg1 路径规划 (静态环境) ---
+    # --- Fig1: Alg1 路径规划 (仅静态障碍物) ---
     fig1, ax1 = plt.subplots(figsize=(7, 6))
     plot_env(ax1, env1, "Alg1: Original Q-learning + ε-greedy (Static)")
-    plot_path_on(ax1, path1, color='lime', label='QL Path')
+    plot_path_on(ax1, path1, color='lime', label='QL ε-greedy Path')
     ax1.set_title("Fig.1: Alg1 Path Planning (Static Obstacles Only)",
                   fontsize=12, fontweight='bold')
     fig1.savefig(OUTDIR + 'Fig1_Alg1_static_path.png', dpi=150, bbox_inches='tight')
     plt.close(fig1)
     print("  保存: Fig1_Alg1_static_path.png")
 
-    # --- Fig2: Alg4 路径规划 (静态+2动态障碍物) ---
+    # --- Fig2: Alg2 路径规划 (静态+2动态障碍物) ---
     fig2, ax2 = plt.subplots(figsize=(7, 6))
-    plot_env(ax2, env4, "Alg4: Proposed SDP-QL + 2 Dynamic Obstacles")
-    plot_path_on(ax2, path4, color='lime', label='SDP-QL Path')
-    ax2.set_title("Fig.2: Alg4 Path Planning (Static + 2 Dynamic Obstacles)",
+    plot_env(ax2, env2, "Alg2: Original Q-learning + ε-greedy (Static + 2 Dyn.)")
+    plot_path_on(ax2, path2, color='lime', label='QL ε-greedy Path')
+    ax2.set_title("Fig.2: Alg2 Path Planning (Static + 2 Dynamic Obstacles)",
                   fontsize=12, fontweight='bold')
-    fig2.savefig(OUTDIR + 'Fig2_Alg4_dynamic_path.png', dpi=150, bbox_inches='tight')
+    fig2.savefig(OUTDIR + 'Fig2_Alg2_egreedy_dynamic_path.png', dpi=150, bbox_inches='tight')
     plt.close(fig2)
-    print("  保存: Fig2_Alg4_dynamic_path.png")
+    print("  保存: Fig2_Alg2_egreedy_dynamic_path.png")
 
-    # --- Fig3: Alg1 收敛曲线 ---
-    fig3, ax3 = plt.subplots(figsize=(8, 4.5))
-    data1 = results['Alg1_OriginalQL_Static']['train_steps']
-    ax3.plot(data1, alpha=0.15, color='steelblue', linewidth=0.5)
-    if len(data1) >= w:
-        sm1 = np.convolve(data1, np.ones(w) / w, mode='valid')
-        ax3.plot(range(w - 1, len(data1)), sm1, color='darkblue',
-                 linewidth=2, label=f'Moving Average (w={w})')
-    ax3.set_title("Fig.3: Alg1 Convergence — Original Q-learning (Static)")
-    ax3.set_xlabel('Episode'); ax3.set_ylabel('Steps per Episode')
-    ax3.grid(True, alpha=0.3); ax3.legend()
-    fig3.savefig(OUTDIR + 'Fig3_Alg1_convergence.png', dpi=150, bbox_inches='tight')
+    # --- Fig3: Alg4 路径规划 (静态+2动态障碍物) ---
+    fig3, ax3 = plt.subplots(figsize=(7, 6))
+    plot_env(ax3, env4, "Alg4: Proposed SDP-QL + 2 Dynamic Obstacles")
+    plot_path_on(ax3, path4, color='lime', label='SDP-QL Path')
+    ax3.set_title("Fig.3: Alg4 Path Planning (Static + 2 Dynamic Obstacles)",
+                  fontsize=12, fontweight='bold')
+    fig3.savefig(OUTDIR + 'Fig3_Alg4_dynamic_path.png', dpi=150, bbox_inches='tight')
     plt.close(fig3)
-    print("  保存: Fig3_Alg1_convergence.png")
+    print("  保存: Fig3_Alg4_dynamic_path.png")
 
-    # --- Fig4: Alg4 收敛曲线 (2个动态障碍物) ---
+    # --- Fig4: Alg1 收敛曲线 (QL+ε-greedy, 仅静态) ---
     fig4, ax4 = plt.subplots(figsize=(8, 4.5))
-    data4 = results['Alg4_ProposedQL_Dynamic']['train_steps']
-    ax4.plot(data4, alpha=0.15, color='darkgreen', linewidth=0.5)
+    data4 = results['Alg1_OriginalQL_Static']['train_steps']
+    ax4.plot(data4, alpha=0.15, color='steelblue', linewidth=0.5)
     if len(data4) >= w:
         sm4 = np.convolve(data4, np.ones(w) / w, mode='valid')
-        ax4.plot(range(w - 1, len(data4)), sm4, color='darkgreen',
+        ax4.plot(range(w - 1, len(data4)), sm4, color='darkblue',
                  linewidth=2, label=f'Moving Average (w={w})')
-    ax4.set_title("Fig.4: Alg4 Convergence — SDP-QL (2 Dynamic Obstacles)")
+    ax4.set_title("Fig.4: Alg1 Convergence - QL+epsilon-greedy (Static Only)")
     ax4.set_xlabel('Episode'); ax4.set_ylabel('Steps per Episode')
     ax4.grid(True, alpha=0.3); ax4.legend()
-    fig4.savefig(OUTDIR + 'Fig4_Alg4_convergence.png', dpi=150, bbox_inches='tight')
+    fig4.savefig(OUTDIR + 'Fig4_Alg1_static_convergence.png', dpi=150, bbox_inches='tight')
     plt.close(fig4)
-    print("  保存: Fig4_Alg4_convergence.png")
+    print("  保存: Fig4_Alg1_static_convergence.png")
 
-    # --- Fig5: 训练时间对比 (同在静态+动态障碍物环境下) ---
-    fig5, ax5 = plt.subplots(figsize=(6, 5))
-    names_bar = ['Q-Learning + ε-greedy\n(Static + 2 Dyn. Obs.)',
-                 'Q-Learning + SDP\n(Static + 2 Dyn. Obs.)']
-    times_bar = [results['Alg2_OriginalQL_Dynamic']['time'],
-                 results['Alg4_ProposedQL_Dynamic']['time']]
-    colors_bar = ['steelblue', 'darkgreen']
-    bars = ax5.bar(names_bar, times_bar, color=colors_bar, edgecolor='black', width=0.5)
-    for bar, t in zip(bars, times_bar):
-        ax5.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
-                 f'{t:.2f}s', ha='center', va='bottom', fontsize=12, fontweight='bold')
-    ax5.set_ylabel('Training Time (seconds)')
-    ax5.set_title('Fig.5: Training Time Comparison (Same Environment)', fontsize=12, fontweight='bold')
-    ax5.grid(True, alpha=0.3, axis='y')
-    fig5.savefig(OUTDIR + 'Fig5_time_comparison.png', dpi=150, bbox_inches='tight')
+    # --- Fig5: Alg2 收敛曲线 (QL+epsilon-greedy, 静态+动态) ---
+    fig5, ax5 = plt.subplots(figsize=(8, 4.5))
+    data5 = results['Alg2_OriginalQL_Dynamic']['train_steps']
+    ax5.plot(data5, alpha=0.15, color='steelblue', linewidth=0.5)
+    if len(data5) >= w:
+        sm5 = np.convolve(data5, np.ones(w) / w, mode='valid')
+        ax5.plot(range(w - 1, len(data5)), sm5, color='darkblue',
+                 linewidth=2, label=f'Moving Average (w={w})')
+    ax5.set_title("Fig.5: Alg2 Convergence - QL+epsilon-greedy (Static + 2 Dyn.)")
+    ax5.set_xlabel('Episode'); ax5.set_ylabel('Steps per Episode')
+    ax5.grid(True, alpha=0.3); ax5.legend()
+    fig5.savefig(OUTDIR + 'Fig5_Alg2_egreedy_convergence.png', dpi=150, bbox_inches='tight')
     plt.close(fig5)
-    print("  保存: Fig5_time_comparison.png")
+    print("  保存: Fig5_Alg2_egreedy_convergence.png")
 
-    print("\n完成! 图表 (Fig.1 ~ Fig.5) 已保存到文件夹。")
+    # --- Fig6: Alg4 收敛曲线 (SDP-QL, 静态+动态) ---
+    fig6, ax6 = plt.subplots(figsize=(8, 4.5))
+    data6 = results['Alg4_ProposedQL_Dynamic']['train_steps']
+    ax6.plot(data6, alpha=0.15, color='darkgreen', linewidth=0.5)
+    if len(data6) >= w:
+        sm6 = np.convolve(data6, np.ones(w) / w, mode='valid')
+        ax6.plot(range(w - 1, len(data6)), sm6, color='darkgreen',
+                 linewidth=2, label=f'Moving Average (w={w})')
+    ax6.set_title("Fig.6: Alg4 Convergence - SDP-QL (Static + 2 Dyn.)")
+    ax6.set_xlabel('Episode'); ax6.set_ylabel('Steps per Episode')
+    ax6.grid(True, alpha=0.3); ax6.legend()
+    fig6.savefig(OUTDIR + 'Fig6_Alg4_convergence.png', dpi=150, bbox_inches='tight')
+    plt.close(fig6)
+    print("  保存: Fig6_Alg4_convergence.png")
+
+    print("\n完成! 图表 (Fig.1 ~ Fig.6) 已保存到文件夹。")
 
 
 if __name__ == '__main__':
