@@ -1,31 +1,30 @@
 """
 复现: Q-learning-based UAV Path Planning with Dynamic Obstacle Avoidance
 物理模型扩展版: USV with physical dimensions and turning radius.
+扩展: 三种障碍物 + GIF轨迹动画
 
-与原始论文的差异:
-  1. 世界尺寸: 1000m x 1000m (100x100栅格, 每格10m)
-  2. USV和障碍物均具有物理尺寸 (长 x 宽矩形)
-  3. USV具有回转半径, 转弯路径为圆弧
-  4. 回转半径在 [Rmin, Rmax] 范围内由模型自行选择避免碰撞
-  5. 碰撞检测使用OBB的分离轴定理 (SAT)
-  6. 航向离散为8个方向, 动作: 直行/左转/右转
-
-参数 (保留论文Table 1精神):
-  - episodes: 5000
-  - alpha: 0.3
-  - gamma: 0.1递增到0.9
-  - epsilon: 0.9
-  - 经验回放缓冲区: 5000
+障碍物类型:
+  1. 静态障碍物 (蓝色) - 固定位置, 有物理尺寸
+  2. 巡逻障碍物 (橙色) - 一直移动, 在两个航点间来回巡逻, 有物理尺寸
+  3. 伏击障碍物 (紫色) - 初始不可探测, 只有临近(探测距离内)才发现,
+     必定出现在既定路线上, 有物理尺寸
 """
 
 import os
+import io
 import numpy as np
 import time
 from collections import deque
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon, FancyBboxPatch
+from matplotlib.patches import Polygon
+
+try:
+    from PIL import Image as PILImage
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
 
 # ============================================================
 # 0. 物理配置常量
@@ -40,6 +39,8 @@ USV_WIDTH = 8.0
 USV_MIN_RADIUS = 15.0
 USV_MAX_RADIUS = 60.0
 
+SAFETY_MARGIN = 10.0
+
 N_HEADINGS = 8
 HEADING_ANGLES = np.array([i * 2 * np.pi / N_HEADINGS for i in range(N_HEADINGS)])
 HEADING_DELTA = 2 * np.pi / N_HEADINGS
@@ -49,8 +50,18 @@ TURN_LEFT = 1
 TURN_RIGHT = 2
 N_ACTIONS = 3
 
-DYNAMIC_OBS_LENGTH = 30.0
-DYNAMIC_OBS_WIDTH = 15.0
+PATROL_OBS_LENGTH = 20.0
+PATROL_OBS_WIDTH = 10.0
+PATROL_SPEED = 4.0
+
+AMBUSH_OBS_LENGTH = 18.0
+AMBUSH_OBS_WIDTH = 12.0
+DETECTION_RANGE = 120.0
+
+STATIC_COLOR = 'royalblue'
+PATROL_COLOR = 'darkorange'
+AMBUSH_COLOR = 'darkviolet'
+AMBUSH_DETECTED_COLOR = 'magenta'
 
 
 # ============================================================
@@ -125,7 +136,7 @@ def compute_turn_arc(x, y, heading_idx, turn_action, radius, n_points=12):
     return xs, ys
 
 
-def compute_forward_line(x, y, heading_idx, n_points=5):
+def compute_forward_line(x, y, heading_idx, n_points=15):
     theta = HEADING_ANGLES[heading_idx]
     dx, dy = np.cos(theta) * CELL_SIZE, np.sin(theta) * CELL_SIZE
     xs = np.linspace(x, x + dx, n_points)
@@ -157,6 +168,64 @@ class PhysicalObstacle:
         self.cy += dy
 
 
+class PatrolObstacle(PhysicalObstacle):
+    """巡逻障碍物: 在两个航点间来回移动, 始终可探测"""
+
+    def __init__(self, cx, cy, length, width, angle,
+                 waypoint_a, waypoint_b, speed=PATROL_SPEED):
+        super().__init__(cx, cy, length, width, angle, is_static=False)
+        self.waypoint_a = np.array(waypoint_a, dtype=float)
+        self.waypoint_b = np.array(waypoint_b, dtype=float)
+        self.speed = speed
+        self.t = 0.5
+        self.direction = 1
+
+    def update(self):
+        total_len = np.linalg.norm(self.waypoint_b - self.waypoint_a)
+        if total_len < 1e-6:
+            return
+        dt = self.speed / total_len
+        self.t += dt * self.direction
+        if self.t > 1.0:
+            self.t = 2.0 - self.t
+            self.direction = -1
+        elif self.t < 0.0:
+            self.t = -self.t
+            self.direction = 1
+        self.t = np.clip(self.t, 0.0, 1.0)
+        self.cx = self.waypoint_a[0] + self.t * (self.waypoint_b[0] - self.waypoint_a[0])
+        self.cy = self.waypoint_a[1] + self.t * (self.waypoint_b[1] - self.waypoint_a[1])
+
+    def copy(self):
+        p = PatrolObstacle(self.cx, self.cy, self.length, self.width, self.angle,
+                           self.waypoint_a.copy(), self.waypoint_b.copy(), self.speed)
+        p.t = self.t
+        p.direction = self.direction
+        return p
+
+
+class AmbushObstacle(PhysicalObstacle):
+    """伏击障碍物: 初始不可探测, 只有USV进入探测范围才发现, 必定在既定路线上"""
+
+    def __init__(self, cx, cy, length, width, angle=0.0, detection_range=DETECTION_RANGE):
+        super().__init__(cx, cy, length, width, angle, is_static=False)
+        self.detected = False
+        self.detection_range = detection_range
+
+    def check_detection(self, usv_x, usv_y):
+        if not self.detected:
+            dist = np.hypot(usv_x - self.cx, usv_y - self.cy)
+            if dist < self.detection_range:
+                self.detected = True
+        return self.detected
+
+    def copy(self):
+        a = AmbushObstacle(self.cx, self.cy, self.length, self.width,
+                           self.angle, self.detection_range)
+        a.detected = self.detected
+        return a
+
+
 # ============================================================
 # 4. USV 物理模型
 # ============================================================
@@ -184,23 +253,19 @@ class PhysicalUSV:
         return pos_to_grid(self.x, self.y)
 
     def _check_swept_collision(self, xs, ys, obstacles, occ_grid=None):
+        safe_l = self.length + 2 * SAFETY_MARGIN
+        safe_w = self.width + 2 * SAFETY_MARGIN
         for i in range(len(xs)):
             cx, cy = xs[i], ys[i]
             if not point_in_world(cx, cy):
                 return True
-            gx, gy = pos_to_grid(cx, cy)
-            if occ_grid is not None and not occ_grid[gx, gy]:
-                for obs in obstacles:
-                    if not obs.is_static and obs.collides_with(cx, cy, self.length, self.width, self.heading_angle):
-                        return True
-                continue
             for obs in obstacles:
-                if obs.collides_with(cx, cy, self.length, self.width, self.heading_angle):
+                if obs.collides_with(cx, cy, safe_l, safe_w, self.heading_angle):
                     return True
         return False
 
     def _choose_turn_radius(self, turn_action, obstacles, occ_grid=None):
-        candidates = np.linspace(self.max_radius, self.min_radius, 5)
+        candidates = np.linspace(self.max_radius, self.min_radius, 8)
         for R in candidates:
             xs, ys = compute_turn_arc(self.x, self.y, self.heading_idx, turn_action, R)
             if not self._check_swept_collision(xs, ys, obstacles, occ_grid):
@@ -254,9 +319,10 @@ class PhysicalUSV:
 
 class USVEnvironment:
 
-    def __init__(self, n_dynamic=0, seed=None):
+    def __init__(self, n_patrol=2, n_ambush=0, seed=None):
         self.rng = np.random.RandomState(seed)
-        self.n_dynamic = n_dynamic
+        self.n_patrol = n_patrol
+        self.n_ambush = n_ambush
 
         max_dim = max(USV_LENGTH, USV_WIDTH) / 2 + CELL_SIZE
         self.start = (max_dim, max_dim)
@@ -266,27 +332,21 @@ class USVEnvironment:
         self.usv = PhysicalUSV(*self.start, heading_idx=self.start_heading)
         self.static_obstacles = self._build_static_obstacles()
         self._static_occ_grid = self._build_occ_grid()
-        self.dynamic_obstacles = []
-        if n_dynamic > 0:
-            self._init_dynamic_obstacles()
+        self.patrol_obstacles = []
+        self.ambush_obstacles = []
+        if n_patrol > 0:
+            self._init_patrol_obstacles()
+        if n_ambush > 0:
+            self._init_ambush_obstacles()
 
     def _build_static_obstacles(self):
         obs = []
-
         obs.append(PhysicalObstacle(
-            cx=250, cy=180, length=140, width=50, angle=0.0, is_static=True))
-
+            cx=220, cy=180, length=160, width=60, angle=0.0, is_static=True))
         obs.append(PhysicalObstacle(
-            cx=500, cy=550, length=340, width=40, angle=0.0, is_static=True))
-
+            cx=600, cy=550, length=300, width=40, angle=0.0, is_static=True))
         obs.append(PhysicalObstacle(
-            cx=750, cy=220, length=60, width=100, angle=0.0, is_static=True))
-        obs.append(PhysicalObstacle(
-            cx=800, cy=240, length=140, width=40, angle=0.0, is_static=True))
-
-        obs.append(PhysicalObstacle(
-            cx=450, cy=830, length=160, width=60, angle=0.0, is_static=True))
-
+            cx=800, cy=830, length=120, width=80, angle=0.0, is_static=True))
         return obs
 
     def _build_occ_grid(self):
@@ -307,21 +367,57 @@ class USVEnvironment:
                         occ[i, j] = True
         return occ
 
-    def _init_dynamic_obstacles(self):
-        self.dynamic_obstacles = []
-        for _ in range(self.n_dynamic):
+    def _init_patrol_obstacles(self):
+        self.patrol_obstacles = []
+
+        p1 = PatrolObstacle(
+            cx=300, cy=400, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=0.0,
+            waypoint_a=(200, 400), waypoint_b=(450, 400), speed=PATROL_SPEED)
+        self.patrol_obstacles.append(p1)
+
+        p2 = PatrolObstacle(
+            cx=800, cy=650, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=0.0,
+            waypoint_a=(800, 580), waypoint_b=(800, 780), speed=PATROL_SPEED)
+        self.patrol_obstacles.append(p2)
+
+    def _init_ambush_obstacles(self):
+        self.ambush_obstacles = []
+        for _ in range(self.n_ambush):
             for _ in range(200):
-                cx = self.rng.uniform(CELL_SIZE * 5, WORLD_SIZE - CELL_SIZE * 5)
-                cy = self.rng.uniform(CELL_SIZE * 5, WORLD_SIZE - CELL_SIZE * 5)
-                temp = PhysicalObstacle(cx, cy, DYNAMIC_OBS_LENGTH, DYNAMIC_OBS_WIDTH,
-                                        angle=0.0, is_static=False)
-                if not self._collides_any_static(temp.cx, temp.cy,
-                                                 DYNAMIC_OBS_LENGTH, DYNAMIC_OBS_WIDTH, 0.0):
-                    if not temp.collides_with(*self.usv.get_rect()):
-                        d_goal = np.hypot(cx - self.goal[0], cy - self.goal[1])
-                        if d_goal > CELL_SIZE * 6:
-                            self.dynamic_obstacles.append(temp)
-                            break
+                cx = self.rng.uniform(CELL_SIZE * 8, WORLD_SIZE - CELL_SIZE * 8)
+                cy = self.rng.uniform(CELL_SIZE * 8, WORLD_SIZE - CELL_SIZE * 8)
+                if self._collides_any_static(cx, cy, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH, 0.0):
+                    continue
+                if self._collides_any_patrol(cx, cy, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH, 0.0):
+                    continue
+                temp = AmbushObstacle(cx, cy, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH)
+                if not temp.collides_with(*self.usv.get_rect()):
+                    d_goal = np.hypot(cx - self.goal[0], cy - self.goal[1])
+                    if d_goal > CELL_SIZE * 6:
+                        self.ambush_obstacles.append(temp)
+                        break
+
+    def place_ambush_on_path(self, path_points):
+        """在规划路上放置伏击障碍物, 路过时探测到并绕行"""
+        if not path_points or len(path_points) < 3:
+            return None
+        mid_idx = min(len(path_points) * 2 // 3, len(path_points) - 1)
+        x, y, h = path_points[mid_idx]
+
+        for _ in range(100):
+            ox = x + self.rng.uniform(-CELL_SIZE * 3, CELL_SIZE * 3)
+            oy = y + self.rng.uniform(-CELL_SIZE * 3, CELL_SIZE * 3)
+            if not point_in_world(ox, oy):
+                continue
+            if (self._collides_any_static(ox, oy, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH, 0.0) or
+                    self._collides_any_patrol(ox, oy, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH, 0.0)):
+                continue
+            aob = AmbushObstacle(ox, oy, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH)
+            self.ambush_obstacles.append(aob)
+            return aob
+        aob = AmbushObstacle(x, y, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH)
+        self.ambush_obstacles.append(aob)
+        return aob
 
     def _collides_any_static(self, cx, cy, length, width, angle):
         for obs in self.static_obstacles:
@@ -329,22 +425,32 @@ class USVEnvironment:
                 return True
         return False
 
-    def _move_dynamic_obstacles(self):
-        dirs = np.array([[CELL_SIZE, 0], [-CELL_SIZE, 0],
-                         [0, CELL_SIZE], [0, -CELL_SIZE]])
-        self.rng.shuffle(dirs)
-        for dob in self.dynamic_obstacles:
-            moved = False
-            for d in dirs:
-                nx, ny = dob.cx + d[0], dob.cy + d[1]
-                if (CELL_SIZE * 2 < nx < WORLD_SIZE - CELL_SIZE * 2 and
-                        CELL_SIZE * 2 < ny < WORLD_SIZE - CELL_SIZE * 2 and
-                        not self._collides_any_static(nx, ny, dob.length, dob.width, dob.angle)):
-                    dob.cx, dob.cy = nx, ny
-                    moved = True
-                    break
-            if not moved:
-                pass
+    def _collides_any_patrol(self, cx, cy, length, width, angle):
+        for pob in self.patrol_obstacles:
+            if pob.collides_with(cx, cy, length, width, angle):
+                return True
+        return False
+
+    def _move_patrol_obstacles(self):
+        for pob in self.patrol_obstacles:
+            pob.update()
+
+    def _check_detection(self):
+        usx, usy = self.usv.x, self.usv.y
+        for aob in self.ambush_obstacles:
+            aob.check_detection(usx, usy)
+
+    def _check_detection_with_pos(self, x, y):
+        for aob in self.ambush_obstacles:
+            aob.check_detection(x, y)
+
+    def get_visible_obstacles(self):
+        visible = list(self.static_obstacles)
+        visible.extend(self.patrol_obstacles)
+        for aob in self.ambush_obstacles:
+            if aob.detected:
+                visible.append(aob)
+        return visible
 
     def get_usv_rect(self):
         return self.usv.get_rect()
@@ -360,12 +466,15 @@ class USVEnvironment:
 
     def reset(self):
         self.usv.reset(*self.start, heading_idx=self.start_heading)
-        if self.n_dynamic > 0:
-            self._init_dynamic_obstacles()
+        if self.n_patrol > 0:
+            self._init_patrol_obstacles()
+        for aob in self.ambush_obstacles:
+            aob.detected = False
         return self.state
 
-    def step(self, action):
-        all_obs = self.static_obstacles + self.dynamic_obstacles
+    def step(self, action, move_patrol=True):
+        self._check_detection()
+        all_obs = self.get_visible_obstacles()
         occ = self._static_occ_grid
 
         if action == FORWARD:
@@ -386,11 +495,15 @@ class USVEnvironment:
         if not point_in_world(self.usv.x, self.usv.y):
             return self.state, -1, True
 
-        if self.n_dynamic > 0:
-            self._move_dynamic_obstacles()
+        if move_patrol:
+            self._move_patrol_obstacles()
 
-        for dob in self.dynamic_obstacles:
+        for dob in self.patrol_obstacles:
             if dob.collides_with(*self.get_usv_rect()):
+                return self.state, -1, True
+
+        for aob in self.ambush_obstacles:
+            if aob.detected and aob.collides_with(*self.get_usv_rect()):
                 return self.state, -1, True
 
         return self.state, 0, False
@@ -434,19 +547,16 @@ class QLearningBase:
 
     def choose_action_sdp(self, state):
         gx, gy, h = state
-        wx, wy = grid_center(gx, gy)
+        wx, wy = self.env.usv.x, self.env.usv.y
 
         temp_usv = PhysicalUSV(wx, wy, heading_idx=h)
-        all_obs = (self.env.static_obstacles +
-                   self.env.dynamic_obstacles if hasattr(self.env, 'dynamic_obstacles')
-                   else self.env.static_obstacles)
-        occ = (self.env._static_occ_grid if hasattr(self.env, '_static_occ_grid')
-               else None)
+        visible = self.env.get_visible_obstacles()
+        occ = self.env._static_occ_grid
 
         goal = self.env.goal
         distances = []
         for a in range(N_ACTIONS):
-            result = temp_usv.try_action(a, all_obs, occ)
+            result = temp_usv.try_action(a, visible, occ)
             if result is None:
                 distances.append(float('inf'))
             else:
@@ -478,18 +588,103 @@ class QLearningBase:
             td_target = r + gamma * np.max(self.q_table[ngx, ngy, nh, :])
             self.q_table[gx, gy, h, a] += self.alpha * (td_target - self.q_table[gx, gy, h, a])
 
-    def get_path(self, max_attempts=3):
-        best_path = []
-        for attempt in range(max_attempts):
-            wx, wy = self.env.start
-            h = self.env.start_heading
-            env_copy = USVEnvironment(n_dynamic=self.env.n_dynamic,
-                                      seed=42 + attempt)
-            env_copy.usv.reset(wx, wy, h)
-            path_points = [(wx, wy, h)]
+    def get_path_sdp(self):
+        for attempt in range(10):
+            env_copy = USVEnvironment(
+                n_patrol=self.env.n_patrol,
+                n_ambush=0,
+                seed=42 + attempt * 100,
+            )
+            env_copy.patrol_obstacles = [p.copy() for p in self.env.patrol_obstacles]
+            for p in env_copy.patrol_obstacles:
+                p.t = 0.5; p.direction = 1
+                p.cx = p.waypoint_a[0] + 0.5 * (p.waypoint_b[0] - p.waypoint_a[0])
+                p.cy = p.waypoint_a[1] + 0.5 * (p.waypoint_b[1] - p.waypoint_a[1])
+            env_copy.ambush_obstacles = [a.copy() for a in self.env.ambush_obstacles]
+            env_copy.static_obstacles = self.env.static_obstacles
+            env_copy._static_occ_grid = self.env._static_occ_grid
+            env_copy.usv.reset(*env_copy.start, heading_idx=env_copy.start_heading)
 
-            all_obs = env_copy.static_obstacles + env_copy.dynamic_obstacles
-            occ = env_copy._static_occ_grid
+            path_points = [(env_copy.usv.x, env_copy.usv.y, env_copy.usv.heading_idx)]
+            max_steps = GRID_SIZE * 10
+            stuck_counter = 0
+
+            for _ in range(max_steps):
+                if env_copy.is_at_goal():
+                    break
+
+                env_copy._check_detection()
+                all_obs = env_copy.get_visible_obstacles()
+                occ = env_copy._static_occ_grid
+
+                h = env_copy.usv.heading_idx
+                sdp_candidates = []
+                temp_usv = PhysicalUSV(env_copy.usv.x, env_copy.usv.y, heading_idx=h)
+                for a in range(N_ACTIONS):
+                    result = temp_usv.try_action(a, all_obs, occ)
+                    if result is not None:
+                        nx, ny, nh = result
+                        d = manhattan_dist_m((nx, ny), env_copy.goal)
+                        sdp_candidates.append((a, d))
+
+                if not sdp_candidates:
+                    stuck_counter += 1
+                    if stuck_counter > 8:
+                        break
+                    for a in range(N_ACTIONS):
+                        ns, r, done = env_copy.step(a, move_patrol=False)
+                        if r >= 0:
+                            path_points.append((env_copy.usv.x, env_copy.usv.y,
+                                                env_copy.usv.heading_idx))
+                            stuck_counter = 0
+                            break
+                    else:
+                        break
+                    continue
+
+                stuck_counter = 0
+                sdp_candidates.sort(key=lambda x: x[1])
+                best_action = sdp_candidates[0][0]
+
+                ns, r, done = env_copy.step(best_action, move_patrol=False)
+                if r < 0:
+                    for a, _ in sdp_candidates[1:]:
+                        ns, r, done = env_copy.step(a, move_patrol=False)
+                        if r >= 0:
+                            best_action = a
+                            break
+                    if r < 0:
+                        break
+                path_points.append((env_copy.usv.x, env_copy.usv.y,
+                                    env_copy.usv.heading_idx))
+                if done and r > 0:
+                    break
+
+            if env_copy.is_at_goal():
+                return path_points
+
+        return path_points
+
+    def get_path(self, max_attempts=5):
+        best_path = []
+
+        for attempt in range(max_attempts):
+            env_copy = USVEnvironment(
+                n_patrol=self.env.n_patrol,
+                n_ambush=0,
+                seed=42 + attempt,
+            )
+            env_copy.patrol_obstacles = [p.copy() for p in self.env.patrol_obstacles]
+            for p in env_copy.patrol_obstacles:
+                p.t = 0.5; p.direction = 1
+                p.cx = p.waypoint_a[0] + 0.5 * (p.waypoint_b[0] - p.waypoint_a[0])
+                p.cy = p.waypoint_a[1] + 0.5 * (p.waypoint_b[1] - p.waypoint_a[1])
+            env_copy.ambush_obstacles = [a.copy() for a in self.env.ambush_obstacles]
+            env_copy.static_obstacles = self.env.static_obstacles
+            env_copy._static_occ_grid = self.env._static_occ_grid
+            env_copy.usv.reset(*env_copy.start, heading_idx=env_copy.start_heading)
+
+            path_points = [(env_copy.usv.x, env_copy.usv.y, env_copy.usv.heading_idx)]
             visited_states = set()
             max_steps = GRID_SIZE * 6
 
@@ -497,29 +692,51 @@ class QLearningBase:
                 if env_copy.is_at_goal():
                     break
 
+                env_copy._check_detection()
+                all_obs = env_copy.get_visible_obstacles()
+                occ = env_copy._static_occ_grid
+
                 gx, gy, h = env_copy.state
                 state_key = (round(env_copy.usv.x), round(env_copy.usv.y), h)
                 if state_key in visited_states:
-                    break
+                    continue
                 visited_states.add(state_key)
+
+                sdp_ranked = []
+                temp_usv = PhysicalUSV(env_copy.usv.x, env_copy.usv.y, heading_idx=h)
+                for a in range(N_ACTIONS):
+                    result = temp_usv.try_action(a, all_obs, occ)
+                    if result is not None:
+                        nx, ny, nh = result
+                        d = manhattan_dist_m((nx, ny), env_copy.goal)
+                        sdp_ranked.append((a, d, result))
+                sdp_ranked.sort(key=lambda x: x[1])
 
                 q_vals = self.q_table[gx, gy, h, :].copy()
                 for a in range(N_ACTIONS):
                     temp = PhysicalUSV(env_copy.usv.x, env_copy.usv.y, heading_idx=h)
-                    result = temp.try_action(a, all_obs, occ)
-                    if result is None:
+                    if temp.try_action(a, all_obs, occ) is None:
                         q_vals[a] = -np.inf
-                    else:
-                        nx, ny, nh = result
-                        if (round(nx), round(ny), nh) in visited_states:
-                            q_vals[a] -= 10.0
 
-                sorted_actions = np.argsort(q_vals)[::-1]
+                action_order = []
+                for a, d, result in sdp_ranked:
+                    nx, ny, nh = result
+                    if (round(nx), round(ny), nh) not in visited_states:
+                        action_order.append(a)
+                for a, d, result in sdp_ranked:
+                    if a not in action_order:
+                        action_order.append(a)
+
+                if not action_order:
+                    for a in range(N_ACTIONS):
+                        if q_vals[a] != -np.inf:
+                            action_order.append(a)
+
                 moved = False
-                for a in sorted_actions:
+                for a in action_order:
                     if q_vals[a] == -np.inf:
                         continue
-                    ns, r, done = env_copy.step(a)
+                    ns, r, done = env_copy.step(a, move_patrol=False)
                     if r >= 0:
                         path_points.append((env_copy.usv.x, env_copy.usv.y,
                                             env_copy.usv.heading_idx))
@@ -527,9 +744,18 @@ class QLearningBase:
                         break
 
                 if not moved:
+                    for a in range(N_ACTIONS):
+                        ns, r, done = env_copy.step(a, move_patrol=False)
+                        if r >= 0:
+                            path_points.append((env_copy.usv.x, env_copy.usv.y,
+                                                env_copy.usv.heading_idx))
+                            moved = True
+                            break
+
+                if not moved:
                     break
 
-            if env_copy.is_at_goal() or len(path_points) > len(best_path):
+            if (env_copy.is_at_goal() or len(path_points) > len(best_path)):
                 best_path = path_points
             if best_path and env_copy.is_at_goal():
                 break
@@ -567,7 +793,7 @@ class Alg2_OriginalQL_Dynamic(QLearningBase):
             self.episode_rewards.append(total_reward)
 
             if verbose and (ep + 1) % 500 == 0:
-                print(f"  Alg2(QL+eps,动态) Ep {ep+1}/{self.episodes}  "
+                print(f"  Alg2(QL+eps) Ep {ep+1}/{self.episodes}  "
                       f"steps={steps}  reward={total_reward:.2f}")
 
 
@@ -597,7 +823,7 @@ class Alg4_ProposedQL_Dynamic(QLearningBase):
             self.episode_rewards.append(total_reward)
 
             if verbose and (ep + 1) % 500 == 0:
-                print(f"  Alg4(SDP-QL,动态) Ep {ep+1}/{self.episodes}  "
+                print(f"  Alg4(SDP-QL) Ep {ep+1}/{self.episodes}  "
                       f"steps={steps}  reward={total_reward:.2f}")
 
 
@@ -605,14 +831,17 @@ class Alg4_ProposedQL_Dynamic(QLearningBase):
 # 8. 可视化
 # ============================================================
 
-def draw_obb(ax, cx, cy, length, width, angle, color, alpha=0.7, lw=1):
+def draw_obb(ax, cx, cy, length, width, angle, color, alpha=0.7, lw=1, zorder=None):
     corners = obb_corners(cx, cy, length, width, angle)
-    poly = Polygon(corners, closed=True, facecolor=color,
-                   edgecolor='black', linewidth=lw, alpha=alpha)
+    kwargs = dict(closed=True, facecolor=color, edgecolor='black',
+                  linewidth=lw, alpha=alpha)
+    if zorder is not None:
+        kwargs['zorder'] = zorder
+    poly = Polygon(corners, **kwargs)
     ax.add_patch(poly)
 
 
-def plot_env(ax, env, title="Environment"):
+def plot_env(ax, env, title="Environment", show_patrol=True, show_ambush=True):
     ax.set_xlim(-20, WORLD_SIZE + 20)
     ax.set_ylim(-20, WORLD_SIZE + 20)
     ax.set_aspect('equal')
@@ -623,11 +852,23 @@ def plot_env(ax, env, title="Environment"):
 
     for obs in env.static_obstacles:
         draw_obb(ax, obs.cx, obs.cy, obs.length, obs.width, obs.angle,
-                 color='royalblue', alpha=0.7, lw=1.5)
+                 color=STATIC_COLOR, alpha=0.7, lw=1.5)
 
-    for dob in env.dynamic_obstacles:
-        draw_obb(ax, dob.cx, dob.cy, dob.length, dob.width, dob.angle,
-                 color='red', alpha=0.5, lw=1.5)
+    if show_patrol:
+        for pob in env.patrol_obstacles:
+            draw_obb(ax, pob.cx, pob.cy, pob.length, pob.width, pob.angle,
+                     color=PATROL_COLOR, alpha=0.5, lw=1.5)
+
+    if show_ambush:
+        for aob in env.ambush_obstacles:
+            if aob.detected:
+                color = AMBUSH_DETECTED_COLOR
+                label = None
+            else:
+                color = AMBUSH_COLOR
+                label = None
+            draw_obb(ax, aob.cx, aob.cy, aob.length, aob.width, aob.angle,
+                     color=color, alpha=0.5, lw=2)
 
     wx, wy = env.start
     ax.plot(wx, wy, 'o', color='orange', markersize=8,
@@ -678,7 +919,128 @@ def plot_convergence(data, title, ylabel, save_path, window=100):
 
 
 # ============================================================
-# 9. 主程序
+# 9. GIF 轨迹动画生成
+# ============================================================
+
+def generate_path_gif(env, path_points, save_path, fps=8, show_detection=True):
+    if not _HAS_PIL:
+        print("  [警告] PIL(Pillow)未安装, 无法生成GIF。请执行: pip install Pillow")
+        _save_frames_as_pngs(env, path_points, save_path.replace('.gif', '_frames'), fps)
+        return
+
+    frames = []
+    env_sim = USVEnvironment(n_patrol=len(env.patrol_obstacles),
+                              n_ambush=0, seed=42)
+    env_sim.patrol_obstacles = [p.copy() for p in env.patrol_obstacles]
+    for p in env_sim.patrol_obstacles:
+        p.t = 0.5; p.direction = 1
+        p.cx = p.waypoint_a[0] + 0.5 * (p.waypoint_b[0] - p.waypoint_a[0])
+        p.cy = p.waypoint_a[1] + 0.5 * (p.waypoint_b[1] - p.waypoint_a[1])
+    env_sim.ambush_obstacles = [a.copy() for a in env.ambush_obstacles]
+    env_sim.static_obstacles = env.static_obstacles
+    env_sim._static_occ_grid = env._static_occ_grid
+
+    total_frames = len(path_points)
+
+    for i, (x, y, h) in enumerate(path_points):
+        env_sim._move_patrol_obstacles()
+        env_sim._check_detection_with_pos(x, y)
+
+        fig, ax = plt.subplots(figsize=(10, 9))
+        ax.set_xlim(-20, WORLD_SIZE + 20)
+        ax.set_ylim(-20, WORLD_SIZE + 20)
+        ax.set_aspect('equal')
+        ax.set_xticks(np.arange(0, WORLD_SIZE + 1, 200))
+        ax.set_yticks(np.arange(0, WORLD_SIZE + 1, 200))
+        ax.set_title(f"USV Path Animation (Step {i+1}/{total_frames})", fontsize=12)
+        ax.grid(True, alpha=0.2)
+
+        for obs in env_sim.static_obstacles:
+            draw_obb(ax, obs.cx, obs.cy, obs.length, obs.width, obs.angle,
+                     color=STATIC_COLOR, alpha=0.7, lw=1.5)
+
+        for pob in env_sim.patrol_obstacles:
+            draw_obb(ax, pob.cx, pob.cy, pob.length, pob.width, pob.angle,
+                     color=PATROL_COLOR, alpha=0.5, lw=1.5)
+
+        for aob in env_sim.ambush_obstacles:
+            if aob.detected:
+                color = AMBUSH_DETECTED_COLOR
+                label = 'Ambush (detected)'
+                draw_obb(ax, aob.cx, aob.cy, aob.length, aob.width, aob.angle,
+                         color=color, alpha=0.6, lw=2)
+                ax.plot(aob.cx, aob.cy, 'x', color='black', markersize=8, zorder=10)
+            else:
+                color = AMBUSH_COLOR
+                draw_obb(ax, aob.cx, aob.cy, aob.length, aob.width, aob.angle,
+                         color=color, alpha=0.2, lw=1, zorder=0)
+
+        if i > 0:
+            xs_trail = [p[0] for p in path_points[:i + 1]]
+            ys_trail = [p[1] for p in path_points[:i + 1]]
+            ax.plot(xs_trail, ys_trail, color='red', linewidth=1.0, alpha=0.5,
+                    linestyle='-', zorder=3)
+
+        draw_obb(ax, x, y, USV_LENGTH, USV_WIDTH, HEADING_ANGLES[h],
+                 color='lime', alpha=0.9, lw=2.5)
+        ax.plot(x, y, 'o', color='lime', markersize=5, zorder=10)
+
+        ax.plot(env.start[0], env.start[1], 'o', color='orange', markersize=8,
+                markeredgecolor='black', zorder=5)
+        ax.plot(env.goal[0], env.goal[1], 's', color='yellow', markersize=8,
+                markeredgecolor='black', zorder=5)
+
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor=STATIC_COLOR, alpha=0.7, label='Static'),
+            Patch(facecolor=PATROL_COLOR, alpha=0.5, label='Patrol'),
+            Patch(facecolor=AMBUSH_COLOR, alpha=0.5, label='Ambush (hidden)'),
+            Patch(facecolor=AMBUSH_DETECTED_COLOR, alpha=0.6, label='Ambush (detected)'),
+            Patch(facecolor='lime', alpha=0.7, label='USV'),
+        ]
+        ax.legend(handles=legend_elements, loc='upper left', fontsize=7)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        img = PILImage.open(buf)
+        frames.append(img.copy())
+        plt.close(fig)
+        buf.close()
+
+        if (i + 1) % 20 == 0 or i == total_frames - 1:
+            print(f"  GIF 帧: {i+1}/{total_frames}")
+
+    duration = int(1000 / fps)
+    frames[0].save(
+        save_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration,
+        loop=0,
+        optimize=False,
+    )
+    print(f"  GIF 保存: {save_path}  ({len(frames)}帧, {fps}fps)")
+
+
+def _save_frames_as_pngs(env, path_points, save_dir, fps=8):
+    os.makedirs(save_dir, exist_ok=True)
+    for i, (x, y, h) in enumerate(path_points):
+        fig, ax = plt.subplots(figsize=(10, 9))
+        plot_env(ax, env, f"USV Path - Frame {i}")
+        draw_obb(ax, x, y, USV_LENGTH, USV_WIDTH, HEADING_ANGLES[h],
+                 color='lime', alpha=0.9, lw=2)
+        if i > 0:
+            xs_trail = [p[0] for p in path_points[:i + 1]]
+            ys_trail = [p[1] for p in path_points[:i + 1]]
+            ax.plot(xs_trail, ys_trail, 'r-', linewidth=1, alpha=0.5)
+        fig.savefig(f"{save_dir}/frame_{i:04d}.png", dpi=100, bbox_inches='tight')
+        plt.close(fig)
+    print(f"  帧保存至: {save_dir}/  ({len(path_points)}帧)")
+
+
+# ============================================================
+# 10. 主程序
 # ============================================================
 
 OUTDIR = 'D:\\QiangHuaXueXi\\Result\\'
@@ -686,29 +1048,33 @@ OUTDIR = 'D:\\QiangHuaXueXi\\Result\\'
 
 def main():
     print("=" * 60)
-    print(" USV Path Planning with Physical Model & Turning Radius")
+    print(" USV Path Planning with Physical Model & 3 Obstacle Types")
     print(f" World: {WORLD_SIZE:.0f}m x {WORLD_SIZE:.0f}m")
     print(f" Grid:  {GRID_SIZE}x{GRID_SIZE} ({CELL_SIZE:.0f}m/cell)")
     print(f" USV:   {USV_LENGTH:.0f}m x {USV_WIDTH:.0f}m")
     print(f" Turn radius: {USV_MIN_RADIUS:.0f}m ~ {USV_MAX_RADIUS:.0f}m")
+    print(f" Obstacles: Static(blue) + Patrol({PATROL_OBS_LENGTH:.0f}x{PATROL_OBS_WIDTH:.0f}m, orange)")
+    print(f"            + Ambush({AMBUSH_OBS_LENGTH:.0f}x{AMBUSH_OBS_WIDTH:.0f}m, purple,")
+    print(f"            detection range={DETECTION_RANGE:.0f}m)")
     print(" Alg2: QL+epsilon-greedy  vs  Alg4: SDP-QL")
     print("=" * 60)
 
     EPISODES = 2000
     SEED = 42
+    N_PATROL = 2
 
     results = {}
 
-    print("\n>>> Algorithm 2: Q-learning + epsilon-greedy (static+2 dynamic)")
+    print("\n>>> Algorithm 2: Q-learning + epsilon-greedy (static + 2 patrol)")
     t0 = time.time()
-    env2 = USVEnvironment(n_dynamic=2, seed=SEED)
+    env2 = USVEnvironment(n_patrol=N_PATROL, n_ambush=0, seed=SEED)
     alg2 = Alg2_OriginalQL_Dynamic(env2, episodes=EPISODES, epsilon=0.7,
-                                   alpha=0.4, step_penalty=-0.001, seed=SEED)
+                                    alpha=0.4, step_penalty=-0.001, seed=SEED)
     alg2.train()
     t1 = time.time()
     path2 = alg2.get_path()
     success2 = len(path2) > 1 and np.hypot(path2[-1][0] - env2.goal[0],
-                                            path2[-1][1] - env2.goal[1]) < CELL_SIZE * 2
+                                             path2[-1][1] - env2.goal[1]) < CELL_SIZE * 2
     results['Alg2_OriginalQL_Dynamic'] = {
         'time': t1 - t0,
         'train_steps': alg2.episode_steps,
@@ -716,21 +1082,39 @@ def main():
         'path': path2,
         'path_len': len(path2),
         'success': success2,
+        'env': env2,
     }
 
     alg2_success_count = sum(1 for r in alg2.episode_rewards if r > 0)
     print(f"  Train: {t1 - t0:.1f}s  Path pts: {len(path2)}  "
           f"GoalReached: {success2}  TrainSuccess: {alg2_success_count}/{EPISODES}")
 
-    print("\n>>> Algorithm 4: SDP-QL (static+2 dynamic)")
+    print("\n>>> Algorithm 4: SDP-QL (static + 2 patrol)")
     t0 = time.time()
-    env4 = USVEnvironment(n_dynamic=2, seed=SEED)
+    env4 = USVEnvironment(n_patrol=N_PATROL, n_ambush=0, seed=SEED)
     alg4 = Alg4_ProposedQL_Dynamic(env4, episodes=EPISODES, seed=SEED)
     alg4.train()
     t1 = time.time()
-    path4 = alg4.get_path()
+
+    prelim_path = alg4.get_path_sdp()
+    print(f"  初步路径点数: {len(prelim_path)}, 到达目标: {np.hypot(prelim_path[-1][0] - env4.goal[0], prelim_path[-1][1] - env4.goal[1]) < CELL_SIZE * 2}")
+
+    if len(prelim_path) > 3:
+        aob = env4.place_ambush_on_path(prelim_path)
+        if aob:
+            print(f"  伏击障碍物已放置在路径上: ({aob.cx:.0f}, {aob.cy:.0f})")
+        else:
+            print("  [警告] 无法放置伏击障碍物")
+    else:
+        print("  [警告] 初步路径太短, 跳过伏击障碍物放置")
+
+    path4 = alg4.get_path_sdp() if len(env4.ambush_obstacles) > 0 else alg4.get_path()
     success4 = len(path4) > 1 and np.hypot(path4[-1][0] - env4.goal[0],
-                                            path4[-1][1] - env4.goal[1]) < CELL_SIZE * 2
+                                             path4[-1][1] - env4.goal[1]) < CELL_SIZE * 2
+
+    ambush_detected = any(aob.detected for aob in env4.ambush_obstacles)
+    print(f"  伏击障碍物是否被探测到: {'是' if ambush_detected else '否'}")
+
     results['Alg4_ProposedQL_Dynamic'] = {
         'time': t1 - t0,
         'train_steps': alg4.episode_steps,
@@ -738,6 +1122,7 @@ def main():
         'path': path4,
         'path_len': len(path4),
         'success': success4,
+        'env': env4,
     }
 
     alg4_success_count = sum(1 for r in alg4.episode_rewards if r > 0)
@@ -759,21 +1144,33 @@ def main():
     w = max(1, EPISODES // 50)
 
     fig1, ax1 = plt.subplots(figsize=(10, 9))
-    plot_env(ax1, env2, "Alg2: QL+epsilon-greedy (Static + 2 Dynamic)")
+    plot_env(ax1, env2, "Alg2: QL+epsilon-greedy (Static + Patrol + Ambush)", show_ambush=False)
     plot_path_with_arcs(ax1, path2, color='lime', label='Alg2 Path')
     ax1.set_title("Fig.1: Alg2 Path (Physical Model, Turning Radius)",
                   fontsize=12, fontweight='bold')
+    legend_elements = [
+        plt.Line2D([0], [0], marker='s', color='w', markerfacecolor=STATIC_COLOR,
+                   markersize=10, label='Static'),
+        plt.Line2D([0], [0], marker='s', color='w', markerfacecolor=PATROL_COLOR,
+                   markersize=10, label='Patrol'),
+    ]
     ax1.legend(loc='upper left', fontsize=8)
     fig1.savefig(OUTDIR + 'Fig1_Alg2_physical_path.png', dpi=150, bbox_inches='tight')
     plt.close(fig1)
     print("  Saved: Fig1_Alg2_physical_path.png")
 
     fig2, ax2 = plt.subplots(figsize=(10, 9))
-    plot_env(ax2, env4, "Alg4: SDP-QL (Static + 2 Dynamic)")
+    plot_env(ax2, env4, "Alg4: SDP-QL (Static + Patrol + Ambush)", show_ambush=True)
     plot_path_with_arcs(ax2, path4, color='lime', label='Alg4 Path')
-    ax2.set_title("Fig.2: Alg4 Path (Physical Model, Turning Radius)",
+    ax2.set_title("Fig.2: Alg4 Path with Ambush Detection (Physical Model)",
                   fontsize=12, fontweight='bold')
-    ax2.legend(loc='upper left', fontsize=8)
+    from matplotlib.patches import Patch
+    legend_elements2 = [
+        Patch(facecolor=STATIC_COLOR, alpha=0.7, label='Static'),
+        Patch(facecolor=PATROL_COLOR, alpha=0.5, label='Patrol'),
+        Patch(facecolor=AMBUSH_DETECTED_COLOR, alpha=0.5, label='Ambush (detected)'),
+    ]
+    ax2.legend(handles=legend_elements2, loc='upper left', fontsize=8)
     fig2.savefig(OUTDIR + 'Fig2_Alg4_physical_path.png', dpi=150, bbox_inches='tight')
     plt.close(fig2)
     print("  Saved: Fig2_Alg4_physical_path.png")
@@ -799,6 +1196,14 @@ def main():
     fig3.savefig(OUTDIR + 'Fig3_physical_convergence.png', dpi=150, bbox_inches='tight')
     plt.close(fig3)
     print("  Saved: Fig3_physical_convergence.png")
+
+    print("\n>>> Generating GIF trajectory animation...")
+    for algo_name, r in results.items():
+        path = r['path']
+        env = r['env']
+        if len(path) > 1:
+            gif_name = algo_name + '_trajectory.gif'
+            generate_path_gif(env, path, OUTDIR + gif_name, fps=8)
 
     print("\nDone!")
 
