@@ -545,6 +545,24 @@ class QLearningBase:
             best = np.where(q_vals == max_q)[0]
             return self.rng.choice(best)
 
+    def rank_actions_sdp(self, state):
+        gx, gy, h = state
+        wx, wy = self.env.usv.x, self.env.usv.y
+        temp_usv = PhysicalUSV(wx, wy, heading_idx=h)
+        visible = self.env.get_visible_obstacles()
+        occ = self.env._static_occ_grid
+        goal = self.env.goal
+
+        candidates = []
+        for a in range(N_ACTIONS):
+            result = temp_usv.try_action(a, visible, occ)
+            if result is not None:
+                nx, ny, nh = result
+                d = manhattan_dist_m((nx, ny), goal)
+                candidates.append((a, d))
+        candidates.sort(key=lambda x: x[1])
+        return candidates
+
     def choose_action_sdp(self, state):
         gx, gy, h = state
         wx, wy = self.env.usv.x, self.env.usv.y
@@ -665,7 +683,7 @@ class QLearningBase:
 
         return path_points
 
-    def get_path(self, max_attempts=5):
+    def get_path_ql(self, max_attempts=5):
         best_path = []
 
         for attempt in range(max_attempts):
@@ -699,38 +717,16 @@ class QLearningBase:
                 gx, gy, h = env_copy.state
                 state_key = (round(env_copy.usv.x), round(env_copy.usv.y), h)
                 if state_key in visited_states:
-                    continue
+                    break
                 visited_states.add(state_key)
 
-                sdp_ranked = []
+                q_vals = self.q_table[gx, gy, h, :].copy()
                 temp_usv = PhysicalUSV(env_copy.usv.x, env_copy.usv.y, heading_idx=h)
                 for a in range(N_ACTIONS):
-                    result = temp_usv.try_action(a, all_obs, occ)
-                    if result is not None:
-                        nx, ny, nh = result
-                        d = manhattan_dist_m((nx, ny), env_copy.goal)
-                        sdp_ranked.append((a, d, result))
-                sdp_ranked.sort(key=lambda x: x[1])
-
-                q_vals = self.q_table[gx, gy, h, :].copy()
-                for a in range(N_ACTIONS):
-                    temp = PhysicalUSV(env_copy.usv.x, env_copy.usv.y, heading_idx=h)
-                    if temp.try_action(a, all_obs, occ) is None:
+                    if temp_usv.try_action(a, all_obs, occ) is None:
                         q_vals[a] = -np.inf
 
-                action_order = []
-                for a, d, result in sdp_ranked:
-                    nx, ny, nh = result
-                    if (round(nx), round(ny), nh) not in visited_states:
-                        action_order.append(a)
-                for a, d, result in sdp_ranked:
-                    if a not in action_order:
-                        action_order.append(a)
-
-                if not action_order:
-                    for a in range(N_ACTIONS):
-                        if q_vals[a] != -np.inf:
-                            action_order.append(a)
+                action_order = list(np.argsort(q_vals)[::-1])
 
                 moved = False
                 for a in action_order:
@@ -744,15 +740,6 @@ class QLearningBase:
                         break
 
                 if not moved:
-                    for a in range(N_ACTIONS):
-                        ns, r, done = env_copy.step(a, move_patrol=False)
-                        if r >= 0:
-                            path_points.append((env_copy.usv.x, env_copy.usv.y,
-                                                env_copy.usv.heading_idx))
-                            moved = True
-                            break
-
-                if not moved:
                     break
 
             if (env_copy.is_at_goal() or len(path_points) > len(best_path)):
@@ -761,6 +748,9 @@ class QLearningBase:
                 break
 
         return best_path
+
+    def get_path(self, max_attempts=5):
+        return self.get_path_ql(max_attempts)
 
 
 # ============================================================
@@ -808,13 +798,22 @@ class Alg4_ProposedQL_Dynamic(QLearningBase):
             max_steps = GRID_SIZE * 5
 
             for _ in range(max_steps):
-                action = self.choose_action_sdp(state)
-                next_state, reward, done = self.env.step(action)
-                reward += self.step_penalty
-                self.update_q(state, action, reward, next_state, gamma)
-                total_reward += reward
-                steps += 1
-                state = next_state
+                candidates = self.rank_actions_sdp(state)
+                moved = False
+                for a, d in candidates:
+                    next_state, reward, done = self.env.step(a)
+                    if reward >= 0:
+                        reward += self.step_penalty
+                        self.update_q(state, a, reward, next_state, gamma)
+                        total_reward += reward
+                        steps += 1
+                        state = next_state
+                        moved = True
+                        if done:
+                            break
+                        break
+                if not moved:
+                    break
                 if done:
                     break
 
@@ -825,6 +824,9 @@ class Alg4_ProposedQL_Dynamic(QLearningBase):
             if verbose and (ep + 1) % 500 == 0:
                 print(f"  Alg4(SDP-QL) Ep {ep+1}/{self.episodes}  "
                       f"steps={steps}  reward={total_reward:.2f}")
+
+    def get_path(self, max_attempts=5):
+        return self.get_path_sdp()
 
 
 # ============================================================
