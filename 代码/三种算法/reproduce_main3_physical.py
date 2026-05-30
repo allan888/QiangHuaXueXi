@@ -875,6 +875,207 @@ class Alg4_ProposedQL_Dynamic(QLearningBase):
 
 
 # ============================================================
+# 7b. DQN 神经网络 (numpy 手写)
+# ============================================================
+
+class DQNNetwork:
+
+    def __init__(self, input_dim, hidden_dims, output_dim, lr=0.001, seed=None):
+        self.lr = lr
+        self.rng = np.random.RandomState(seed)
+        dims = [input_dim] + list(hidden_dims) + [output_dim]
+        self.weights = []
+        self.biases = []
+        for i in range(len(dims) - 1):
+            fan_in, fan_out = dims[i], dims[i + 1]
+            limit = np.sqrt(6.0 / (fan_in + fan_out))
+            W = self.rng.uniform(-limit, limit, (fan_out, fan_in))
+            b = np.zeros(fan_out)
+            self.weights.append(W)
+            self.biases.append(b)
+        self.n_layers = len(self.weights)
+
+    def forward(self, x):
+        self.z = []
+        self.h = [x]
+        a = x
+        for i in range(self.n_layers):
+            z = a @ self.weights[i].T + self.biases[i]
+            self.z.append(z)
+            if i == self.n_layers - 1:
+                a = z
+            else:
+                a = np.maximum(0, z)
+            self.h.append(a)
+        return a
+
+    def backward(self, x_batch, y_batch):
+        B = x_batch.shape[0]
+        q_pred = self.forward(x_batch)
+        loss = np.mean((q_pred - y_batch) ** 2)
+        dq = (q_pred - y_batch) / B
+
+        for i in range(self.n_layers - 1, -1, -1):
+            z = self.z[i]
+            h_prev = self.h[i]
+            if i == self.n_layers - 1:
+                dz = dq
+            else:
+                dz = dq * (z > 0)
+            dW = dz.T @ h_prev
+            db = dz.sum(axis=0)
+            if i > 0:
+                dq = dz @ self.weights[i]
+            self.weights[i] -= self.lr * dW
+            self.biases[i] -= self.lr * db
+        return loss
+
+    def copy_from(self, other):
+        for i in range(self.n_layers):
+            self.weights[i] = other.weights[i].copy()
+            self.biases[i] = other.biases[i].copy()
+
+
+# ============================================================
+# 7c. Alg5: DQN + SDP
+# ============================================================
+
+STATE_INPUT_DIM = 2 + N_HEADINGS
+DQN_HIDDEN = [64, 64]
+DQN_LR = 0.001
+DQN_BUFFER_SIZE = 10000
+DQN_BATCH_SIZE = 64
+TARGET_UPDATE_FREQ = 10
+
+
+class Alg5_DQN_SDP(QLearningBase):
+
+    def __init__(self, env, alpha=0.3, gamma_start=0.1, gamma_end=0.9,
+                 epsilon=0.9, epsilon_decay=0.997, epsilon_min=0.02,
+                 episodes=5000, step_penalty=0.0, distance_reward=0.05,
+                 seed=None):
+        super().__init__(env, alpha, gamma_start, gamma_end, epsilon,
+                         epsilon_decay, epsilon_min, episodes,
+                         step_penalty, distance_reward, seed)
+        self.online_net = DQNNetwork(STATE_INPUT_DIM, DQN_HIDDEN, N_ACTIONS,
+                                     lr=DQN_LR, seed=seed)
+        self.target_net = DQNNetwork(STATE_INPUT_DIM, DQN_HIDDEN, N_ACTIONS,
+                                     lr=DQN_LR, seed=seed)
+        self.target_net.copy_from(self.online_net)
+        self.dqn_replay_buffer = deque(maxlen=DQN_BUFFER_SIZE)
+        self.target_update_freq = TARGET_UPDATE_FREQ
+        self.loss_history = []
+
+    def _encode_state(self, state):
+        gx, gy, h = state
+        x_norm = gx / float(GRID_SIZE - 1)
+        y_norm = gy / float(GRID_SIZE - 1)
+        h_onehot = np.zeros(N_HEADINGS)
+        h_onehot[h] = 1.0
+        return np.concatenate([[x_norm, y_norm], h_onehot])
+
+    def _encode_batch(self, states):
+        return np.array([self._encode_state(s) for s in states])
+
+    def _predict_q_online(self, state):
+        x = self._encode_state(state).reshape(1, -1)
+        return self.online_net.forward(x)[0]
+
+    def _predict_q_online_batch(self, states):
+        x_batch = self._encode_batch(states)
+        return self.online_net.forward(x_batch)
+
+    def _predict_q_target_batch(self, states):
+        x_batch = self._encode_batch(states)
+        return self.target_net.forward(x_batch)
+
+    def update_q(self, state, action, reward, next_state, gamma):
+        self.dqn_replay_buffer.append((state, action, reward, next_state))
+
+    def _train_network_step(self, gamma):
+        if len(self.dqn_replay_buffer) < DQN_BATCH_SIZE:
+            return 0.0
+        indices = self.rng.choice(len(self.dqn_replay_buffer),
+                                  DQN_BATCH_SIZE, replace=False)
+        batch_s, batch_a, batch_r, batch_ns = [], [], [], []
+        for idx in indices:
+            s, a, r, ns = self.dqn_replay_buffer[idx]
+            batch_s.append(s)
+            batch_a.append(a)
+            batch_r.append(r)
+            batch_ns.append(ns)
+
+        q_online = self._predict_q_online_batch(batch_s)
+        q_target_next = self._predict_q_target_batch(batch_ns)
+        max_next_q = np.max(q_target_next, axis=1)
+        targets = np.array(batch_r) + gamma * max_next_q
+
+        y_batch = q_online.copy()
+        for i, a in enumerate(batch_a):
+            y_batch[i, a] = targets[i]
+
+        x_batch = self._encode_batch(batch_s)
+        loss = self.online_net.backward(x_batch, y_batch)
+        return loss
+
+    def train(self, verbose=True):
+        for ep in range(self.episodes):
+            state = self.env.reset()
+            gamma = self.get_gamma(ep)
+            total_reward = 0
+            steps = 0
+            replan_count = 0
+            collision_count = 0
+            max_steps = GRID_SIZE * 5
+
+            for _ in range(max_steps):
+                candidates = self.rank_actions_sdp(state)
+                moved = False
+                first_try = True
+                for a, d in candidates:
+                    next_state, reward, done = self.env.step(a)
+                    if reward < 0:
+                        collision_count += 1
+                        if first_try:
+                            replan_count += 1
+                            first_try = False
+                        continue
+                    else:
+                        reward += self.step_penalty
+                        self.update_q(state, a, reward, next_state, gamma)
+                        total_reward += reward
+                        steps += 1
+                        state = next_state
+                        moved = True
+                        if done:
+                            break
+                        break
+                if not moved:
+                    break
+                if done:
+                    break
+
+            loss = self._train_network_step(gamma)
+            self.loss_history.append(loss)
+
+            if (ep + 1) % self.target_update_freq == 0:
+                self.target_net.copy_from(self.online_net)
+
+            self.episode_steps.append(steps)
+            self.episode_rewards.append(total_reward)
+            self.episode_replans.append(replan_count)
+            self.episode_collisions.append(collision_count)
+
+            if verbose and (ep + 1) % 500 == 0:
+                print(f"  Alg5(DQN+SDP) Ep {ep+1}/{self.episodes}  "
+                      f"steps={steps}  reward={total_reward:.2f}  "
+                      f"replans={replan_count}  loss={loss:.6f}")
+
+    def get_path(self, max_attempts=5):
+        return self.get_path_sdp()
+
+
+# ============================================================
 # 8. 可视化
 # ============================================================
 
@@ -1190,12 +1391,41 @@ def main():
           f"GoalReached: {success4}  TrainSuccess: {alg4_success_count}/{EPISODES}")
     print(f"  AvgReward: {avg_reward4:.4f}  TotalReplans: {total_replans4}  TotalCollisions: {total_collisions4}")
 
+    print("\n>>> Algorithm 5: DQN + SDP (static + 2 patrol)")
+    t0 = time.time()
+    env5 = USVEnvironment(n_patrol=N_PATROL, n_ambush=0, seed=SEED)
+    alg5 = Alg5_DQN_SDP(env5, episodes=EPISODES, seed=SEED)
+    alg5.train()
+    t1 = time.time()
+    path5 = alg5.get_path()
+    success5 = len(path5) > 1 and np.hypot(path5[-1][0] - env5.goal[0],
+                                              path5[-1][1] - env5.goal[1]) < CELL_SIZE * 2
+    results['Alg5_DQN_SDP'] = {
+        'time': t1 - t0,
+        'train_steps': alg5.episode_steps,
+        'train_rewards': alg5.episode_rewards,
+        'train_replans': alg5.episode_replans,
+        'train_collisions': alg5.episode_collisions,
+        'path': path5,
+        'path_len': len(path5),
+        'success': success5,
+        'env': env5,
+    }
+
+    alg5_success_count = sum(1 for r in alg5.episode_rewards if r > 0)
+    avg_reward5 = np.mean(alg5.episode_rewards[-500:]) if len(alg5.episode_rewards) >= 500 else np.mean(alg5.episode_rewards)
+    total_replans5 = sum(alg5.episode_replans)
+    total_collisions5 = sum(alg5.episode_collisions)
+    print(f"  Train: {t1 - t0:.1f}s  Path pts: {len(path5)}  "
+          f"GoalReached: {success5}  TrainSuccess: {alg5_success_count}/{EPISODES}")
+    print(f"  AvgReward: {avg_reward5:.4f}  TotalReplans: {total_replans5}  TotalCollisions: {total_collisions5}")
+
     print("\n" + "=" * 70)
     print(" Evaluation Metrics")
     print("=" * 70)
     print(f" {'Algorithm':<30} {'Train(s)':>8} {'Steps':>8} {'Success':>8} {'AvgRew':>8} {'Replans':>8} {'Collis':>8}")
     print("-" * 78)
-    for name in ['Alg2_OriginalQL_Dynamic', 'Alg4_ProposedQL_Dynamic']:
+    for name in ['Alg2_OriginalQL_Dynamic', 'Alg4_ProposedQL_Dynamic', 'Alg5_DQN_SDP']:
         r = results[name]
         rewards = r['train_rewards']
         avg_r = np.mean(rewards[-500:]) if len(rewards) >= 500 else np.mean(rewards)
@@ -1253,7 +1483,13 @@ def main():
         sm = np.convolve(d4, np.ones(w) / w, mode='valid')
         ax3.plot(range(w - 1, len(d4)), sm, color='darkgreen',
                  linewidth=2, label='Alg4 (SDP-QL)')
-    ax3.set_title("Fig.3: Convergence Comparison (Physical Model)")
+    d5 = results['Alg5_DQN_SDP']['train_steps']
+    ax3.plot(d5, alpha=0.15, color='crimson', linewidth=0.5)
+    if len(d5) >= w:
+        sm = np.convolve(d5, np.ones(w) / w, mode='valid')
+        ax3.plot(range(w - 1, len(d5)), sm, color='darkred',
+                 linewidth=2, label='Alg5 (DQN+SDP)')
+    ax3.set_title("Fig.3: Convergence Comparison (Steps)")
     ax3.set_xlabel('Episode')
     ax3.set_ylabel('Steps per Episode')
     ax3.grid(True, alpha=0.3)
@@ -1275,6 +1511,12 @@ def main():
         sm = np.convolve(r4, np.ones(w) / w, mode='valid')
         ax4.plot(range(w - 1, len(r4)), sm, color='darkgreen',
                  linewidth=2, label='Alg4 (SDP-QL)')
+    r5 = results['Alg5_DQN_SDP']['train_rewards']
+    ax4.plot(r5, alpha=0.15, color='crimson', linewidth=0.5)
+    if len(r5) >= w:
+        sm = np.convolve(r5, np.ones(w) / w, mode='valid')
+        ax4.plot(range(w - 1, len(r5)), sm, color='darkred',
+                 linewidth=2, label='Alg5 (DQN+SDP)')
     ax4.set_title("Fig.4: Cumulative Reward Convergence (avg reward)")
     ax4.set_xlabel('Episode')
     ax4.set_ylabel('Cumulative Reward')
@@ -1297,6 +1539,12 @@ def main():
         sm = np.convolve(rp4, np.ones(w) / w, mode='valid')
         ax5.plot(range(w - 1, len(rp4)), sm, color='darkgreen',
                  linewidth=2, label='Alg4 (SDP-QL)')
+    rp5 = results['Alg5_DQN_SDP']['train_replans']
+    ax5.plot(rp5, alpha=0.15, color='crimson', linewidth=0.5)
+    if len(rp5) >= w:
+        sm = np.convolve(rp5, np.ones(w) / w, mode='valid')
+        ax5.plot(range(w - 1, len(rp5)), sm, color='darkred',
+                 linewidth=2, label='Alg5 (DQN+SDP)')
     ax5.set_title("Fig.5: Replanning Count per Episode")
     ax5.set_xlabel('Episode')
     ax5.set_ylabel('Replanning Events')
