@@ -39,7 +39,7 @@ USV_WIDTH = 8.0
 USV_MIN_RADIUS = 15.0
 USV_MAX_RADIUS = 60.0
 
-SAFETY_MARGIN = 10.0
+SAFETY_MARGIN = 5.0
 
 N_HEADINGS = 8
 HEADING_ANGLES = np.array([i * 2 * np.pi / N_HEADINGS for i in range(N_HEADINGS)])
@@ -54,9 +54,9 @@ PATROL_OBS_LENGTH = 20.0
 PATROL_OBS_WIDTH = 10.0
 PATROL_SPEED = 4.0
 
-AMBUSH_OBS_LENGTH = 18.0
-AMBUSH_OBS_WIDTH = 12.0
-DETECTION_RANGE = 120.0
+AMBUSH_OBS_LENGTH = 10.0
+AMBUSH_OBS_WIDTH = 8.0
+DETECTION_RANGE = 200.0
 
 STATIC_COLOR = 'royalblue'
 PATROL_COLOR = 'darkorange'
@@ -404,20 +404,30 @@ class USVEnvironment:
         mid_idx = min(len(path_points) * 2 // 3, len(path_points) - 1)
         x, y, h = path_points[mid_idx]
 
-        for _ in range(100):
-            ox = x + self.rng.uniform(-CELL_SIZE * 3, CELL_SIZE * 3)
-            oy = y + self.rng.uniform(-CELL_SIZE * 3, CELL_SIZE * 3)
+        for _ in range(200):
+            ox = x + self.rng.uniform(-CELL_SIZE * 6, CELL_SIZE * 6)
+            oy = y + self.rng.uniform(-CELL_SIZE * 6, CELL_SIZE * 6)
             if not point_in_world(ox, oy):
                 continue
             if (self._collides_any_static(ox, oy, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH, 0.0) or
                     self._collides_any_patrol(ox, oy, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH, 0.0)):
                 continue
             aob = AmbushObstacle(ox, oy, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH)
+            if self._is_passage_blocked_by(aob, x, y, h):
+                continue
             self.ambush_obstacles.append(aob)
             return aob
         aob = AmbushObstacle(x, y, AMBUSH_OBS_LENGTH, AMBUSH_OBS_WIDTH)
         self.ambush_obstacles.append(aob)
         return aob
+
+    def _is_passage_blocked_by(self, ambush, x, y, h):
+        all_obs = list(self.static_obstacles) + list(self.patrol_obstacles) + [ambush]
+        temp = PhysicalUSV(x, y, heading_idx=h)
+        for a in range(N_ACTIONS):
+            if temp.try_action(a, all_obs, self._static_occ_grid) is not None:
+                return False
+        return True
 
     def _collides_any_static(self, cx, cy, length, width, angle):
         for obs in self.static_obstacles:
@@ -718,8 +728,8 @@ class QLearningBase:
             env_copy.usv.reset(*env_copy.start, heading_idx=env_copy.start_heading)
 
             path_points = [(env_copy.usv.x, env_copy.usv.y, env_copy.usv.heading_idx)]
-            visited_states = set()
-            max_steps = GRID_SIZE * 6
+            max_steps = GRID_SIZE * 8
+            stuck_counter = 0
 
             for _ in range(max_steps):
                 if env_copy.is_at_goal():
@@ -729,32 +739,65 @@ class QLearningBase:
                 all_obs = env_copy.get_visible_obstacles()
                 occ = env_copy._static_occ_grid
 
-                gx, gy, h = env_copy.state
-                state_key = (round(env_copy.usv.x), round(env_copy.usv.y), h)
-                if state_key in visited_states:
-                    break
-                visited_states.add(state_key)
-
-                q_vals = self.q_table[gx, gy, h, :].copy()
+                h = env_copy.usv.heading_idx
                 temp_usv = PhysicalUSV(env_copy.usv.x, env_copy.usv.y, heading_idx=h)
+
+                sdp_candidates = []
                 for a in range(N_ACTIONS):
-                    if temp_usv.try_action(a, all_obs, occ) is None:
-                        q_vals[a] = -np.inf
+                    result = temp_usv.try_action(a, all_obs, occ)
+                    if result is not None:
+                        nx, ny, nh = result
+                        d = manhattan_dist_m((nx, ny), env_copy.goal)
+                        sdp_candidates.append((a, d))
 
-                action_order = list(np.argsort(q_vals)[::-1])
-
-                moved = False
-                for a in action_order:
-                    if q_vals[a] == -np.inf:
-                        continue
-                    ns, r, done = env_copy.step(a, move_patrol=False)
-                    if r >= 0:
-                        path_points.append((env_copy.usv.x, env_copy.usv.y,
-                                            env_copy.usv.heading_idx))
-                        moved = True
+                if not sdp_candidates:
+                    stuck_counter += 1
+                    if stuck_counter > 8:
                         break
+                    for a in range(N_ACTIONS):
+                        ns, r, done = env_copy.step(a, move_patrol=False)
+                        if r >= 0:
+                            path_points.append((env_copy.usv.x, env_copy.usv.y,
+                                                env_copy.usv.heading_idx))
+                            stuck_counter = 0
+                            break
+                    else:
+                        break
+                    continue
 
-                if not moved:
+                stuck_counter = 0
+
+                sdp_candidates.sort(key=lambda x: x[1])
+                best_dist = sdp_candidates[0][1]
+                tied = [ca for ca in sdp_candidates if ca[1] == best_dist]
+
+                if len(tied) > 1:
+                    gx, gy, h_state = env_copy.state
+                    q_vals = self.q_table[gx, gy, h_state, :]
+                    tied.sort(key=lambda x: q_vals[x[0]], reverse=True)
+
+                best_action = tied[0][0]
+                ns, r, done = env_copy.step(best_action, move_patrol=False)
+                if r < 0:
+                    for a, _ in tied[1:]:
+                        ns, r, done = env_copy.step(a, move_patrol=False)
+                        if r >= 0:
+                            best_action = a
+                            break
+                    else:
+                        for a, _ in sdp_candidates:
+                            if a == tied[0][0]:
+                                continue
+                            ns, r, done = env_copy.step(a, move_patrol=False)
+                            if r >= 0:
+                                best_action = a
+                                break
+                        if r < 0:
+                            break
+
+                path_points.append((env_copy.usv.x, env_copy.usv.y,
+                                    env_copy.usv.heading_idx))
+                if done and r > 0:
                     break
 
             if (env_copy.is_at_goal() or len(path_points) > len(best_path)):
@@ -774,6 +817,9 @@ class QLearningBase:
 
 class Alg2_OriginalQL_Dynamic(QLearningBase):
 
+    def get_path(self, max_attempts=5):
+        return self.get_path_sdp()
+
     def train(self, verbose=True):
         for ep in range(self.episodes):
             state = self.env.reset()
@@ -782,7 +828,8 @@ class Alg2_OriginalQL_Dynamic(QLearningBase):
             steps = 0
             replan_count = 0
             collision_count = 0
-            max_steps = GRID_SIZE * 5
+            max_steps = GRID_SIZE * 4
+            stuck_counter = 0
 
             prev_dist = self._distance_to_goal(self.env.usv.x, self.env.usv.y)
 
@@ -793,8 +840,20 @@ class Alg2_OriginalQL_Dynamic(QLearningBase):
                 if reward < 0:
                     collision_count += 1
                     replan_count += 1
+                    stuck_counter += 1
+                    reward += self.step_penalty
+                    self.update_q(state, action, reward, next_state, gamma)
+                    total_reward += reward
+                    steps += 1
+                    if stuck_counter > 15:
+                        break
+                    self.env.usv.reset(*self.env.start, heading_idx=self.env.start_heading)
+                    prev_dist = self._distance_to_goal(self.env.usv.x, self.env.usv.y)
+                    state = self.env.state
+                    continue
 
                 if reward >= 0:
+                    stuck_counter = 0
                     cur_dist = self._distance_to_goal(self.env.usv.x, self.env.usv.y)
                     reward += (prev_dist - cur_dist) * self.distance_reward / WORLD_SIZE
                     prev_dist = cur_dist
@@ -941,8 +1000,8 @@ class DQNNetwork:
 # ============================================================
 
 STATE_INPUT_DIM = 2 + N_HEADINGS
-DQN_HIDDEN = [64, 64]
-DQN_LR = 0.001
+DQN_HIDDEN = [64, 96]
+DQN_LR = 0.0005
 DQN_BUFFER_SIZE = 10000
 DQN_BATCH_SIZE = 64
 TARGET_UPDATE_FREQ = 10
@@ -1048,8 +1107,8 @@ class Alg5_DQN_SDP(QLearningBase):
             env_copy.usv.reset(*env_copy.start, heading_idx=env_copy.start_heading)
 
             path_points = [(env_copy.usv.x, env_copy.usv.y, env_copy.usv.heading_idx)]
-            visited_states = set()
-            max_steps = GRID_SIZE * 6
+            max_steps = GRID_SIZE * 8
+            stuck_counter = 0
 
             for _ in range(max_steps):
                 if env_copy.is_at_goal():
@@ -1059,32 +1118,65 @@ class Alg5_DQN_SDP(QLearningBase):
                 all_obs = env_copy.get_visible_obstacles()
                 occ = env_copy._static_occ_grid
 
-                gx, gy, h = env_copy.state
-                state_key = (round(env_copy.usv.x), round(env_copy.usv.y), h)
-                if state_key in visited_states:
-                    break
-                visited_states.add(state_key)
-
-                q_vals = self._predict_q_online((gx, gy, h))
+                h = env_copy.usv.heading_idx
                 temp_usv = PhysicalUSV(env_copy.usv.x, env_copy.usv.y, heading_idx=h)
+
+                sdp_candidates = []
                 for a in range(N_ACTIONS):
-                    if temp_usv.try_action(a, all_obs, occ) is None:
-                        q_vals[a] = -np.inf
+                    result = temp_usv.try_action(a, all_obs, occ)
+                    if result is not None:
+                        nx, ny, nh = result
+                        d = manhattan_dist_m((nx, ny), env_copy.goal)
+                        sdp_candidates.append((a, d))
 
-                action_order = list(np.argsort(q_vals)[::-1])
-
-                moved = False
-                for a in action_order:
-                    if q_vals[a] == -np.inf:
-                        continue
-                    ns, r, done = env_copy.step(a, move_patrol=False)
-                    if r >= 0:
-                        path_points.append((env_copy.usv.x, env_copy.usv.y,
-                                            env_copy.usv.heading_idx))
-                        moved = True
+                if not sdp_candidates:
+                    stuck_counter += 1
+                    if stuck_counter > 8:
                         break
+                    for a in range(N_ACTIONS):
+                        ns, r, done = env_copy.step(a, move_patrol=False)
+                        if r >= 0:
+                            path_points.append((env_copy.usv.x, env_copy.usv.y,
+                                                env_copy.usv.heading_idx))
+                            stuck_counter = 0
+                            break
+                    else:
+                        break
+                    continue
 
-                if not moved:
+                stuck_counter = 0
+
+                sdp_candidates.sort(key=lambda x: x[1])
+                best_dist = sdp_candidates[0][1]
+                tied = [ca for ca in sdp_candidates if ca[1] == best_dist]
+
+                if len(tied) > 1:
+                    gx, gy, h_state = env_copy.state
+                    q_vals = self._predict_q_online((gx, gy, h_state))
+                    tied.sort(key=lambda x: q_vals[x[0]], reverse=True)
+
+                best_action = tied[0][0]
+                ns, r, done = env_copy.step(best_action, move_patrol=False)
+                if r < 0:
+                    for a, _ in tied[1:]:
+                        ns, r, done = env_copy.step(a, move_patrol=False)
+                        if r >= 0:
+                            best_action = a
+                            break
+                    else:
+                        for a, _ in sdp_candidates:
+                            if a == tied[0][0]:
+                                continue
+                            ns, r, done = env_copy.step(a, move_patrol=False)
+                            if r >= 0:
+                                best_action = a
+                                break
+                        if r < 0:
+                            break
+
+                path_points.append((env_copy.usv.x, env_copy.usv.y,
+                                    env_copy.usv.heading_idx))
+                if done and r > 0:
                     break
 
             if (env_copy.is_at_goal() or len(path_points) > len(best_path)):
@@ -1102,7 +1194,7 @@ class Alg5_DQN_SDP(QLearningBase):
             steps = 0
             replan_count = 0
             collision_count = 0
-            max_steps = GRID_SIZE * 3
+            max_steps = GRID_SIZE * 4
             stuck_counter = 0
 
             for _ in range(max_steps):
@@ -1527,8 +1619,8 @@ def main():
     print("\n>>> Algorithm 5: DQN (static + 2 patrol)")
     t0 = time.time()
     env5 = USVEnvironment(n_patrol=N_PATROL, n_ambush=0, seed=SEED)
-    alg5 = Alg5_DQN_SDP(env5, episodes=EPISODES, epsilon=0.3,
-                         epsilon_decay=0.995, epsilon_min=0.02,
+    alg5 = Alg5_DQN_SDP(env5, episodes=EPISODES, epsilon=0.1,
+                         epsilon_decay=0.995, epsilon_min=0.01,
                          alpha=0.4, step_penalty=-0.001,
                          distance_reward=0.05, seed=SEED)
     alg5.train()
