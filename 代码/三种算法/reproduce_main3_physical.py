@@ -1018,6 +1018,82 @@ class Alg5_DQN_SDP(QLearningBase):
         loss = self.online_net.backward(x_batch, y_batch)
         return loss
 
+    def choose_action_egreedy_dqn(self, state):
+        gx, gy, h = state
+        if self.rng.random() < self.epsilon:
+            return self.rng.randint(0, N_ACTIONS)
+        else:
+            q_vals = self._predict_q_online(state)
+            max_q = np.max(q_vals)
+            best = np.where(q_vals == max_q)[0]
+            return self.rng.choice(best)
+
+    def get_path_dqn(self, max_attempts=5):
+        best_path = []
+
+        for attempt in range(max_attempts):
+            env_copy = USVEnvironment(
+                n_patrol=self.env.n_patrol,
+                n_ambush=0,
+                seed=42 + attempt,
+            )
+            env_copy.patrol_obstacles = [p.copy() for p in self.env.patrol_obstacles]
+            for p in env_copy.patrol_obstacles:
+                p.t = 0.5; p.direction = 1
+                p.cx = p.waypoint_a[0] + 0.5 * (p.waypoint_b[0] - p.waypoint_a[0])
+                p.cy = p.waypoint_a[1] + 0.5 * (p.waypoint_b[1] - p.waypoint_a[1])
+            env_copy.ambush_obstacles = [a.copy() for a in self.env.ambush_obstacles]
+            env_copy.static_obstacles = self.env.static_obstacles
+            env_copy._static_occ_grid = self.env._static_occ_grid
+            env_copy.usv.reset(*env_copy.start, heading_idx=env_copy.start_heading)
+
+            path_points = [(env_copy.usv.x, env_copy.usv.y, env_copy.usv.heading_idx)]
+            visited_states = set()
+            max_steps = GRID_SIZE * 6
+
+            for _ in range(max_steps):
+                if env_copy.is_at_goal():
+                    break
+
+                env_copy._check_detection()
+                all_obs = env_copy.get_visible_obstacles()
+                occ = env_copy._static_occ_grid
+
+                gx, gy, h = env_copy.state
+                state_key = (round(env_copy.usv.x), round(env_copy.usv.y), h)
+                if state_key in visited_states:
+                    break
+                visited_states.add(state_key)
+
+                q_vals = self._predict_q_online((gx, gy, h))
+                temp_usv = PhysicalUSV(env_copy.usv.x, env_copy.usv.y, heading_idx=h)
+                for a in range(N_ACTIONS):
+                    if temp_usv.try_action(a, all_obs, occ) is None:
+                        q_vals[a] = -np.inf
+
+                action_order = list(np.argsort(q_vals)[::-1])
+
+                moved = False
+                for a in action_order:
+                    if q_vals[a] == -np.inf:
+                        continue
+                    ns, r, done = env_copy.step(a, move_patrol=False)
+                    if r >= 0:
+                        path_points.append((env_copy.usv.x, env_copy.usv.y,
+                                            env_copy.usv.heading_idx))
+                        moved = True
+                        break
+
+                if not moved:
+                    break
+
+            if (env_copy.is_at_goal() or len(path_points) > len(best_path)):
+                best_path = path_points
+            if best_path and env_copy.is_at_goal():
+                break
+
+        return best_path
+
     def train(self, verbose=True):
         for ep in range(self.episodes):
             state = self.env.reset()
@@ -1026,37 +1102,82 @@ class Alg5_DQN_SDP(QLearningBase):
             steps = 0
             replan_count = 0
             collision_count = 0
-            max_steps = GRID_SIZE * 5
+            max_steps = GRID_SIZE * 3
+            stuck_counter = 0
 
             for _ in range(max_steps):
-                candidates = self.rank_actions_sdp(state)
-                moved = False
-                first_try = True
-                for a, d in candidates:
-                    next_state, reward, done = self.env.step(a)
+                if self.rng.random() < self.epsilon:
+                    q_vals = self._predict_q_online(state)
+                    gx, gy, h = state
+                    temp_usv = PhysicalUSV(self.env.usv.x, self.env.usv.y, heading_idx=h)
+                    visible = self.env.get_visible_obstacles()
+                    occ = self.env._static_occ_grid
+                    for a in range(N_ACTIONS):
+                        if temp_usv.try_action(a, visible, occ) is None:
+                            q_vals[a] = -np.inf
+                    valid = [a for a in range(N_ACTIONS) if q_vals[a] > -np.inf]
+                    if not valid:
+                        action = self.rng.randint(0, N_ACTIONS)
+                    else:
+                        if self.rng.random() < 0.1:
+                            action = self.rng.choice(valid)
+                        else:
+                            action = valid[np.argmax([q_vals[a] for a in valid])]
+
+                    next_state, reward, done = self.env.step(action)
+                    reward += self.step_penalty
+                    self.update_q(state, action, reward, next_state, gamma)
+                    total_reward += reward
+                    steps += 1
+
                     if reward < 0:
                         collision_count += 1
-                        if first_try:
-                            replan_count += 1
-                            first_try = False
+                        replan_count += 1
+                        stuck_counter += 1
+                        if stuck_counter > 20:
+                            break
+                        state = self.env.reset()
+                        self.env.usv.heading_idx = self.rng.randint(0, N_HEADINGS)
+                        state = self.env.state
                         continue
                     else:
-                        reward += self.step_penalty
-                        self.update_q(state, a, reward, next_state, gamma)
-                        total_reward += reward
-                        steps += 1
+                        stuck_counter = 0
                         state = next_state
-                        moved = True
                         if done:
                             break
+                else:
+                    candidates = self.rank_actions_sdp(state)
+                    moved = False
+                    first_try = True
+                    for a, d in candidates:
+                        next_state, reward, done = self.env.step(a)
+                        if reward < 0:
+                            collision_count += 1
+                            if first_try:
+                                replan_count += 1
+                                first_try = False
+                            continue
+                        else:
+                            reward += self.step_penalty
+                            self.update_q(state, a, reward, next_state, gamma)
+                            total_reward += reward
+                            steps += 1
+                            state = next_state
+                            moved = True
+                            if done:
+                                break
+                            break
+                    if not moved:
                         break
-                if not moved:
-                    break
-                if done:
-                    break
+                    if done:
+                        break
 
-            loss = self._train_network_step(gamma)
-            self.loss_history.append(loss)
+            self.decay_epsilon()
+
+            replay_rounds = max(1, min(steps // 4, 4))
+            for _ in range(replay_rounds):
+                loss = self._train_network_step(gamma)
+                self.loss_history.append(loss)
 
             if (ep + 1) % self.target_update_freq == 0:
                 self.target_net.copy_from(self.online_net)
@@ -1067,12 +1188,14 @@ class Alg5_DQN_SDP(QLearningBase):
             self.episode_collisions.append(collision_count)
 
             if verbose and (ep + 1) % 500 == 0:
-                print(f"  Alg5(DQN+SDP) Ep {ep+1}/{self.episodes}  "
+                avg_loss = np.mean(self.loss_history[-500:]) if len(self.loss_history) >= 500 else (np.mean(self.loss_history) if self.loss_history else 0.0)
+                print(f"  Alg5(DQN) Ep {ep+1}/{self.episodes}  "
                       f"steps={steps}  reward={total_reward:.2f}  "
-                      f"replans={replan_count}  loss={loss:.6f}")
+                      f"eps={self.epsilon:.3f}  replans={replan_count}  "
+                      f"collisions={collision_count}  loss={avg_loss:.6f}")
 
     def get_path(self, max_attempts=5):
-        return self.get_path_sdp()
+        return self.get_path_dqn(max_attempts)
 
 
 # ============================================================
@@ -1304,7 +1427,7 @@ def main():
     print(f" Obstacles: Static(blue) + Patrol({PATROL_OBS_LENGTH:.0f}x{PATROL_OBS_WIDTH:.0f}m, orange)")
     print(f"            + Ambush({AMBUSH_OBS_LENGTH:.0f}x{AMBUSH_OBS_WIDTH:.0f}m, purple,")
     print(f"            detection range={DETECTION_RANGE:.0f}m)")
-    print(" Alg2: QL+epsilon-greedy  vs  Alg4: SDP-QL")
+    print(" Alg2: QL+epsilon-greedy  vs  Alg4: SDP-QL  vs  Alg5: DQN")
     print("=" * 60)
 
     EPISODES = 2000
@@ -1322,9 +1445,19 @@ def main():
                                     distance_reward=0.05, seed=SEED)
     alg2.train()
     t1 = time.time()
-    path2 = alg2.get_path()
+
+    prelim_path2 = alg2.get_path()
+    if len(prelim_path2) > 3:
+        aob2 = env2.place_ambush_on_path(prelim_path2)
+        if aob2:
+            print(f"  暗礁(伏击障碍物)已放置在Alg2路径上: ({aob2.cx:.0f}, {aob2.cy:.0f})")
+        path2 = alg2.get_path()
+    else:
+        path2 = prelim_path2
+        print("  [警告] Alg2初步路径太短, 跳过暗礁放置")
+
     success2 = len(path2) > 1 and np.hypot(path2[-1][0] - env2.goal[0],
-                                             path2[-1][1] - env2.goal[1]) < CELL_SIZE * 2
+                                              path2[-1][1] - env2.goal[1]) < CELL_SIZE * 2
     results['Alg2_OriginalQL_Dynamic'] = {
         'time': t1 - t0,
         'train_steps': alg2.episode_steps,
@@ -1391,13 +1524,25 @@ def main():
           f"GoalReached: {success4}  TrainSuccess: {alg4_success_count}/{EPISODES}")
     print(f"  AvgReward: {avg_reward4:.4f}  TotalReplans: {total_replans4}  TotalCollisions: {total_collisions4}")
 
-    print("\n>>> Algorithm 5: DQN + SDP (static + 2 patrol)")
+    print("\n>>> Algorithm 5: DQN (static + 2 patrol)")
     t0 = time.time()
     env5 = USVEnvironment(n_patrol=N_PATROL, n_ambush=0, seed=SEED)
-    alg5 = Alg5_DQN_SDP(env5, episodes=EPISODES, seed=SEED)
+    alg5 = Alg5_DQN_SDP(env5, episodes=EPISODES, epsilon=0.3,
+                         epsilon_decay=0.995, epsilon_min=0.02,
+                         alpha=0.4, step_penalty=-0.001,
+                         distance_reward=0.05, seed=SEED)
     alg5.train()
     t1 = time.time()
-    path5 = alg5.get_path()
+
+    prelim_path5 = alg5.get_path()
+    if len(prelim_path5) > 3:
+        aob5 = env5.place_ambush_on_path(prelim_path5)
+        if aob5:
+            print(f"  暗礁(伏击障碍物)已放置在Alg5路径上: ({aob5.cx:.0f}, {aob5.cy:.0f})")
+        path5 = alg5.get_path()
+    else:
+        path5 = prelim_path5
+        print("  [警告] Alg5初步路径太短, 跳过暗礁放置")
     success5 = len(path5) > 1 and np.hypot(path5[-1][0] - env5.goal[0],
                                               path5[-1][1] - env5.goal[1]) < CELL_SIZE * 2
     results['Alg5_DQN_SDP'] = {
