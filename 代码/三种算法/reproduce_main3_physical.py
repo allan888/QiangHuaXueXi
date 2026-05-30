@@ -842,11 +842,9 @@ class Alg4_ProposedQL_Dynamic(QLearningBase):
                         collision_count += 1
                         if first_try:
                             replan_count += 1
-                        first_try = False
+                            first_try = False
                         continue
                     else:
-                        if not first_try:
-                            replan_count += 1
                         reward += self.step_penalty
                         self.update_q(state, a, reward, next_state, gamma)
                         total_reward += reward
