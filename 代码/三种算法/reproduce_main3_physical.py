@@ -534,6 +534,8 @@ class QLearningBase:
 
         self.episode_steps = []
         self.episode_rewards = []
+        self.episode_replans = []
+        self.episode_collisions = []
 
     def get_gamma(self, episode):
         progress = min(episode / self.episodes, 1.0)
@@ -778,6 +780,8 @@ class Alg2_OriginalQL_Dynamic(QLearningBase):
             gamma = self.get_gamma(ep)
             total_reward = 0
             steps = 0
+            replan_count = 0
+            collision_count = 0
             max_steps = GRID_SIZE * 5
 
             prev_dist = self._distance_to_goal(self.env.usv.x, self.env.usv.y)
@@ -785,6 +789,10 @@ class Alg2_OriginalQL_Dynamic(QLearningBase):
             for _ in range(max_steps):
                 action = self.choose_action_egreedy(state)
                 next_state, reward, done = self.env.step(action)
+
+                if reward < 0:
+                    collision_count += 1
+                    replan_count += 1
 
                 if reward >= 0:
                     cur_dist = self._distance_to_goal(self.env.usv.x, self.env.usv.y)
@@ -803,11 +811,13 @@ class Alg2_OriginalQL_Dynamic(QLearningBase):
             self.experience_replay(gamma)
             self.episode_steps.append(steps)
             self.episode_rewards.append(total_reward)
+            self.episode_replans.append(replan_count)
+            self.episode_collisions.append(collision_count)
 
             if verbose and (ep + 1) % 500 == 0:
                 print(f"  Alg2(QL+eps) Ep {ep+1}/{self.episodes}  "
                       f"steps={steps}  reward={total_reward:.2f}  "
-                      f"eps={self.epsilon:.3f}")
+                      f"eps={self.epsilon:.3f}  replans={replan_count}  collisions={collision_count}")
 
 
 class Alg4_ProposedQL_Dynamic(QLearningBase):
@@ -818,14 +828,25 @@ class Alg4_ProposedQL_Dynamic(QLearningBase):
             gamma = self.get_gamma(ep)
             total_reward = 0
             steps = 0
+            replan_count = 0
+            collision_count = 0
             max_steps = GRID_SIZE * 5
 
             for _ in range(max_steps):
                 candidates = self.rank_actions_sdp(state)
                 moved = False
+                first_try = True
                 for a, d in candidates:
                     next_state, reward, done = self.env.step(a)
-                    if reward >= 0:
+                    if reward < 0:
+                        collision_count += 1
+                        if first_try:
+                            replan_count += 1
+                        first_try = False
+                        continue
+                    else:
+                        if not first_try:
+                            replan_count += 1
                         reward += self.step_penalty
                         self.update_q(state, a, reward, next_state, gamma)
                         total_reward += reward
@@ -843,10 +864,13 @@ class Alg4_ProposedQL_Dynamic(QLearningBase):
             self.experience_replay(gamma)
             self.episode_steps.append(steps)
             self.episode_rewards.append(total_reward)
+            self.episode_replans.append(replan_count)
+            self.episode_collisions.append(collision_count)
 
             if verbose and (ep + 1) % 500 == 0:
                 print(f"  Alg4(SDP-QL) Ep {ep+1}/{self.episodes}  "
-                      f"steps={steps}  reward={total_reward:.2f}")
+                      f"steps={steps}  reward={total_reward:.2f}  "
+                      f"replans={replan_count}  collisions={collision_count}")
 
     def get_path(self, max_attempts=5):
         return self.get_path_sdp()
@@ -1106,6 +1130,8 @@ def main():
         'time': t1 - t0,
         'train_steps': alg2.episode_steps,
         'train_rewards': alg2.episode_rewards,
+        'train_replans': alg2.episode_replans,
+        'train_collisions': alg2.episode_collisions,
         'path': path2,
         'path_len': len(path2),
         'success': success2,
@@ -1113,8 +1139,12 @@ def main():
     }
 
     alg2_success_count = sum(1 for r in alg2.episode_rewards if r > 0)
+    avg_reward2 = np.mean(alg2.episode_rewards[-500:]) if len(alg2.episode_rewards) >= 500 else np.mean(alg2.episode_rewards)
+    total_replans2 = sum(alg2.episode_replans)
+    total_collisions2 = sum(alg2.episode_collisions)
     print(f"  Train: {t1 - t0:.1f}s  Path pts: {len(path2)}  "
           f"GoalReached: {success2}  TrainSuccess: {alg2_success_count}/{EPISODES}")
+    print(f"  AvgReward: {avg_reward2:.4f}  TotalReplans: {total_replans2}  TotalCollisions: {total_collisions2}")
 
     print("\n>>> Algorithm 4: SDP-QL (static + 2 patrol)")
     t0 = time.time()
@@ -1146,6 +1176,8 @@ def main():
         'time': t1 - t0,
         'train_steps': alg4.episode_steps,
         'train_rewards': alg4.episode_rewards,
+        'train_replans': alg4.episode_replans,
+        'train_collisions': alg4.episode_collisions,
         'path': path4,
         'path_len': len(path4),
         'success': success4,
@@ -1153,18 +1185,26 @@ def main():
     }
 
     alg4_success_count = sum(1 for r in alg4.episode_rewards if r > 0)
+    avg_reward4 = np.mean(alg4.episode_rewards[-500:]) if len(alg4.episode_rewards) >= 500 else np.mean(alg4.episode_rewards)
+    total_replans4 = sum(alg4.episode_replans)
+    total_collisions4 = sum(alg4.episode_collisions)
     print(f"  Train: {t1 - t0:.1f}s  Path pts: {len(path4)}  "
           f"GoalReached: {success4}  TrainSuccess: {alg4_success_count}/{EPISODES}")
+    print(f"  AvgReward: {avg_reward4:.4f}  TotalReplans: {total_replans4}  TotalCollisions: {total_collisions4}")
 
-    print("\n" + "=" * 60)
-    print(" Comparison")
-    print("=" * 60)
-    print(f" {'Algorithm':<30} {'Train(s)':>8} {'Steps':>8} {'Success':>8}")
-    print("-" * 58)
+    print("\n" + "=" * 70)
+    print(" Evaluation Metrics")
+    print("=" * 70)
+    print(f" {'Algorithm':<30} {'Train(s)':>8} {'Steps':>8} {'Success':>8} {'AvgRew':>8} {'Replans':>8} {'Collis':>8}")
+    print("-" * 78)
     for name in ['Alg2_OriginalQL_Dynamic', 'Alg4_ProposedQL_Dynamic']:
         r = results[name]
+        rewards = r['train_rewards']
+        avg_r = np.mean(rewards[-500:]) if len(rewards) >= 500 else np.mean(rewards)
+        total_rp = sum(r['train_replans'])
+        total_col = sum(r['train_collisions'])
         print(f" {name:<30} {r['time']:>8.1f} {r['path_len']:>8}  "
-              f"{'Yes' if r['success'] else 'No':>8}")
+              f"{'Yes' if r['success'] else 'No':>8} {avg_r:>8.3f} {total_rp:>8} {total_col:>8}")
 
     print("\n>>> Generating figures...")
     os.makedirs(OUTDIR, exist_ok=True)
@@ -1223,6 +1263,50 @@ def main():
     fig3.savefig(OUTDIR + 'Fig3_physical_convergence.png', dpi=150, bbox_inches='tight')
     plt.close(fig3)
     print("  Saved: Fig3_physical_convergence.png")
+
+    fig4, ax4 = plt.subplots(figsize=(9, 5))
+    r2 = results['Alg2_OriginalQL_Dynamic']['train_rewards']
+    ax4.plot(r2, alpha=0.15, color='steelblue', linewidth=0.5)
+    if len(r2) >= w:
+        sm = np.convolve(r2, np.ones(w) / w, mode='valid')
+        ax4.plot(range(w - 1, len(r2)), sm, color='darkblue',
+                 linewidth=2, label='Alg2 (eps-greedy)')
+    r4 = results['Alg4_ProposedQL_Dynamic']['train_rewards']
+    ax4.plot(r4, alpha=0.15, color='darkgreen', linewidth=0.5)
+    if len(r4) >= w:
+        sm = np.convolve(r4, np.ones(w) / w, mode='valid')
+        ax4.plot(range(w - 1, len(r4)), sm, color='darkgreen',
+                 linewidth=2, label='Alg4 (SDP-QL)')
+    ax4.set_title("Fig.4: Cumulative Reward Convergence (avg reward)")
+    ax4.set_xlabel('Episode')
+    ax4.set_ylabel('Cumulative Reward')
+    ax4.grid(True, alpha=0.3)
+    ax4.legend()
+    fig4.savefig(OUTDIR + 'Fig4_reward_convergence.png', dpi=150, bbox_inches='tight')
+    plt.close(fig4)
+    print("  Saved: Fig4_reward_convergence.png")
+
+    fig5, ax5 = plt.subplots(figsize=(9, 5))
+    rp2 = results['Alg2_OriginalQL_Dynamic']['train_replans']
+    ax5.plot(rp2, alpha=0.15, color='steelblue', linewidth=0.5)
+    if len(rp2) >= w:
+        sm = np.convolve(rp2, np.ones(w) / w, mode='valid')
+        ax5.plot(range(w - 1, len(rp2)), sm, color='darkblue',
+                 linewidth=2, label='Alg2 (eps-greedy)')
+    rp4 = results['Alg4_ProposedQL_Dynamic']['train_replans']
+    ax5.plot(rp4, alpha=0.15, color='darkgreen', linewidth=0.5)
+    if len(rp4) >= w:
+        sm = np.convolve(rp4, np.ones(w) / w, mode='valid')
+        ax5.plot(range(w - 1, len(rp4)), sm, color='darkgreen',
+                 linewidth=2, label='Alg4 (SDP-QL)')
+    ax5.set_title("Fig.5: Replanning Count per Episode")
+    ax5.set_xlabel('Episode')
+    ax5.set_ylabel('Replanning Events')
+    ax5.grid(True, alpha=0.3)
+    ax5.legend()
+    fig5.savefig(OUTDIR + 'Fig5_replanning_convergence.png', dpi=150, bbox_inches='tight')
+    plt.close(fig5)
+    print("  Saved: Fig5_replanning_convergence.png")
 
     print("\n>>> Generating GIF trajectory animation...")
     for algo_name, r in results.items():
