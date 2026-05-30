@@ -515,14 +515,18 @@ class USVEnvironment:
 
 class QLearningBase:
     def __init__(self, env, alpha=0.3, gamma_start=0.1, gamma_end=0.9,
-                 epsilon=0.9, episodes=5000, step_penalty=0.0, seed=None):
+                 epsilon=0.9, epsilon_decay=0.997, epsilon_min=0.02,
+                 episodes=5000, step_penalty=0.0, distance_reward=0.05, seed=None):
         self.env = env
         self.alpha = alpha
         self.gamma_start = gamma_start
         self.gamma_end = gamma_end
         self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
         self.episodes = episodes
         self.step_penalty = step_penalty
+        self.distance_reward = distance_reward
         self.rng = np.random.RandomState(seed)
 
         self.q_table = np.zeros((GRID_SIZE, GRID_SIZE, N_HEADINGS, N_ACTIONS))
@@ -534,6 +538,15 @@ class QLearningBase:
     def get_gamma(self, episode):
         progress = min(episode / self.episodes, 1.0)
         return self.gamma_start + (self.gamma_end - self.gamma_start) * progress
+
+    def get_epsilon(self):
+        return max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def decay_epsilon(self):
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def _distance_to_goal(self, x, y):
+        return np.hypot(x - self.env.goal[0], y - self.env.goal[1])
 
     def choose_action_egreedy(self, state):
         gx, gy, h = state
@@ -767,9 +780,17 @@ class Alg2_OriginalQL_Dynamic(QLearningBase):
             steps = 0
             max_steps = GRID_SIZE * 5
 
+            prev_dist = self._distance_to_goal(self.env.usv.x, self.env.usv.y)
+
             for _ in range(max_steps):
                 action = self.choose_action_egreedy(state)
                 next_state, reward, done = self.env.step(action)
+
+                if reward >= 0:
+                    cur_dist = self._distance_to_goal(self.env.usv.x, self.env.usv.y)
+                    reward += (prev_dist - cur_dist) * self.distance_reward / WORLD_SIZE
+                    prev_dist = cur_dist
+
                 reward += self.step_penalty
                 self.update_q(state, action, reward, next_state, gamma)
                 total_reward += reward
@@ -778,13 +799,15 @@ class Alg2_OriginalQL_Dynamic(QLearningBase):
                 if done:
                     break
 
+            self.decay_epsilon()
             self.experience_replay(gamma)
             self.episode_steps.append(steps)
             self.episode_rewards.append(total_reward)
 
             if verbose and (ep + 1) % 500 == 0:
                 print(f"  Alg2(QL+eps) Ep {ep+1}/{self.episodes}  "
-                      f"steps={steps}  reward={total_reward:.2f}")
+                      f"steps={steps}  reward={total_reward:.2f}  "
+                      f"eps={self.epsilon:.3f}")
 
 
 class Alg4_ProposedQL_Dynamic(QLearningBase):
@@ -1070,8 +1093,10 @@ def main():
     print("\n>>> Algorithm 2: Q-learning + epsilon-greedy (static + 2 patrol)")
     t0 = time.time()
     env2 = USVEnvironment(n_patrol=N_PATROL, n_ambush=0, seed=SEED)
-    alg2 = Alg2_OriginalQL_Dynamic(env2, episodes=EPISODES, epsilon=0.7,
-                                    alpha=0.4, step_penalty=-0.001, seed=SEED)
+    alg2 = Alg2_OriginalQL_Dynamic(env2, episodes=EPISODES, epsilon=1.0,
+                                    epsilon_decay=0.995, epsilon_min=0.02,
+                                    alpha=0.4, step_penalty=-0.001,
+                                    distance_reward=0.05, seed=SEED)
     alg2.train()
     t1 = time.time()
     path2 = alg2.get_path()
