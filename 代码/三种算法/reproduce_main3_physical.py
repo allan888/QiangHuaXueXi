@@ -15,6 +15,9 @@ import io
 import numpy as np
 import time
 from collections import deque
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -62,6 +65,8 @@ STATIC_COLOR = 'royalblue'
 PATROL_COLOR = 'darkorange'
 AMBUSH_COLOR = 'darkviolet'
 AMBUSH_DETECTED_COLOR = 'magenta'
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 # ============================================================
@@ -346,7 +351,7 @@ class USVEnvironment:
         obs.append(PhysicalObstacle(
             cx=600, cy=550, length=300, width=40, angle=0.0, is_static=True))
         obs.append(PhysicalObstacle(
-            cx=800, cy=830, length=120, width=80, angle=0.0, is_static=True))
+            cx=250, cy=800, length=120, width=80, angle=0.0, is_static=True))
         return obs
 
     def _build_occ_grid(self):
@@ -371,13 +376,13 @@ class USVEnvironment:
         self.patrol_obstacles = []
 
         p1 = PatrolObstacle(
-            cx=300, cy=400, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=0.0,
+            cx=325, cy=400, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=0.0,
             waypoint_a=(200, 400), waypoint_b=(450, 400), speed=PATROL_SPEED)
         self.patrol_obstacles.append(p1)
 
         p2 = PatrolObstacle(
-            cx=800, cy=650, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=0.0,
-            waypoint_a=(800, 580), waypoint_b=(800, 780), speed=PATROL_SPEED)
+            cx=700, cy=425, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=np.pi / 2,
+            waypoint_a=(700, 300), waypoint_b=(700, 550), speed=PATROL_SPEED)
         self.patrol_obstacles.append(p2)
 
     def _init_ambush_obstacles(self):
@@ -937,62 +942,25 @@ class Alg4_ProposedQL_Dynamic(QLearningBase):
 # 7b. DQN 神经网络 (numpy 手写)
 # ============================================================
 
-class DQNNetwork:
+class DQNNetwork(nn.Module):
 
-    def __init__(self, input_dim, hidden_dims, output_dim, lr=0.001, seed=None):
-        self.lr = lr
-        self.rng = np.random.RandomState(seed)
-        dims = [input_dim] + list(hidden_dims) + [output_dim]
-        self.weights = []
-        self.biases = []
+    def __init__(self, input_dim, hidden_dims, output_dim, lr=0.001):
+        super().__init__()
+        layers = []
+        dims = [input_dim] + list(hidden_dims)
         for i in range(len(dims) - 1):
-            fan_in, fan_out = dims[i], dims[i + 1]
-            limit = np.sqrt(6.0 / (fan_in + fan_out))
-            W = self.rng.uniform(-limit, limit, (fan_out, fan_in))
-            b = np.zeros(fan_out)
-            self.weights.append(W)
-            self.biases.append(b)
-        self.n_layers = len(self.weights)
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(nn.ReLU())
+        layers.append(nn.Linear(dims[-1], output_dim))
+        self.net = nn.Sequential(*layers)
+        self.optimizer = optim.Adam(self.parameters(), lr=lr)
+        self.to(DEVICE)
 
     def forward(self, x):
-        self.z = []
-        self.h = [x]
-        a = x
-        for i in range(self.n_layers):
-            z = a @ self.weights[i].T + self.biases[i]
-            self.z.append(z)
-            if i == self.n_layers - 1:
-                a = z
-            else:
-                a = np.maximum(0, z)
-            self.h.append(a)
-        return a
-
-    def backward(self, x_batch, y_batch):
-        B = x_batch.shape[0]
-        q_pred = self.forward(x_batch)
-        loss = np.mean((q_pred - y_batch) ** 2)
-        dq = (q_pred - y_batch) / B
-
-        for i in range(self.n_layers - 1, -1, -1):
-            z = self.z[i]
-            h_prev = self.h[i]
-            if i == self.n_layers - 1:
-                dz = dq
-            else:
-                dz = dq * (z > 0)
-            dW = dz.T @ h_prev
-            db = dz.sum(axis=0)
-            if i > 0:
-                dq = dz @ self.weights[i]
-            self.weights[i] -= self.lr * dW
-            self.biases[i] -= self.lr * db
-        return loss
+        return self.net(x)
 
     def copy_from(self, other):
-        for i in range(self.n_layers):
-            self.weights[i] = other.weights[i].copy()
-            self.biases[i] = other.biases[i].copy()
+        self.load_state_dict(other.state_dict())
 
 
 # ============================================================
@@ -1016,10 +984,12 @@ class Alg5_DQN_SDP(QLearningBase):
         super().__init__(env, alpha, gamma_start, gamma_end, epsilon,
                          epsilon_decay, epsilon_min, episodes,
                          step_penalty, distance_reward, seed)
+        if seed is not None:
+            torch.manual_seed(seed)
         self.online_net = DQNNetwork(STATE_INPUT_DIM, DQN_HIDDEN, N_ACTIONS,
-                                     lr=DQN_LR, seed=seed)
+                                     lr=DQN_LR)
         self.target_net = DQNNetwork(STATE_INPUT_DIM, DQN_HIDDEN, N_ACTIONS,
-                                     lr=DQN_LR, seed=seed)
+                                     lr=DQN_LR)
         self.target_net.copy_from(self.online_net)
         self.dqn_replay_buffer = deque(maxlen=DQN_BUFFER_SIZE)
         self.target_update_freq = TARGET_UPDATE_FREQ
@@ -1037,16 +1007,22 @@ class Alg5_DQN_SDP(QLearningBase):
         return np.array([self._encode_state(s) for s in states])
 
     def _predict_q_online(self, state):
-        x = self._encode_state(state).reshape(1, -1)
-        return self.online_net.forward(x)[0]
+        x = torch.from_numpy(self._encode_state(state).astype(np.float32)).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            q = self.online_net(x)
+        return q.cpu().numpy()[0]
 
     def _predict_q_online_batch(self, states):
-        x_batch = self._encode_batch(states)
-        return self.online_net.forward(x_batch)
+        x_batch = torch.from_numpy(self._encode_batch(states).astype(np.float32)).to(DEVICE)
+        with torch.no_grad():
+            q = self.online_net(x_batch)
+        return q.cpu().numpy()
 
     def _predict_q_target_batch(self, states):
-        x_batch = self._encode_batch(states)
-        return self.target_net.forward(x_batch)
+        x_batch = torch.from_numpy(self._encode_batch(states).astype(np.float32)).to(DEVICE)
+        with torch.no_grad():
+            q = self.target_net(x_batch)
+        return q.cpu().numpy()
 
     def update_q(self, state, action, reward, next_state, gamma):
         self.dqn_replay_buffer.append((state, action, reward, next_state))
@@ -1064,18 +1040,25 @@ class Alg5_DQN_SDP(QLearningBase):
             batch_r.append(r)
             batch_ns.append(ns)
 
-        q_online = self._predict_q_online_batch(batch_s)
-        q_target_next = self._predict_q_target_batch(batch_ns)
-        max_next_q = np.max(q_target_next, axis=1)
-        targets = np.array(batch_r) + gamma * max_next_q
+        x_batch = torch.from_numpy(self._encode_batch(batch_s).astype(np.float32)).to(DEVICE)
+        ns_batch = torch.from_numpy(self._encode_batch(batch_ns).astype(np.float32)).to(DEVICE)
 
-        y_batch = q_online.copy()
+        with torch.no_grad():
+            max_next_q = self.target_net(ns_batch).max(dim=1)[0]
+
+        targets = torch.tensor(batch_r, dtype=torch.float32, device=DEVICE) + gamma * max_next_q
+
+        q_online = self.online_net(x_batch)
+        y_batch = q_online.clone()
         for i, a in enumerate(batch_a):
             y_batch[i, a] = targets[i]
 
-        x_batch = self._encode_batch(batch_s)
-        loss = self.online_net.backward(x_batch, y_batch)
-        return loss
+        loss = nn.functional.mse_loss(q_online, y_batch)
+        self.online_net.optimizer.zero_grad()
+        loss.backward()
+        self.online_net.optimizer.step()
+
+        return loss.item()
 
     def choose_action_egreedy_dqn(self, state):
         gx, gy, h = state
@@ -1287,7 +1270,7 @@ class Alg5_DQN_SDP(QLearningBase):
                       f"collisions={collision_count}  loss={avg_loss:.6f}")
 
     def get_path(self, max_attempts=5):
-        return self.get_path_dqn(max_attempts)
+        return self.get_path_ql(max_attempts)
 
 
 # ============================================================
@@ -1520,6 +1503,11 @@ def main():
     print(f"            + Ambush({AMBUSH_OBS_LENGTH:.0f}x{AMBUSH_OBS_WIDTH:.0f}m, purple,")
     print(f"            detection range={DETECTION_RANGE:.0f}m)")
     print(" Alg2: QL+epsilon-greedy  vs  Alg4: SDP-QL  vs  Alg5: DQN")
+    if DEVICE.type == 'cuda':
+        print(f" Device: {DEVICE} (GPU)")
+    else:
+        print(f" Device: {DEVICE} (no CUDA GPU detected. Install PyTorch with CUDA for GPU training)")
+        print(f"        pip uninstall torch; pip install torch --index-url https://download.pytorch.org/whl/cu121")
     print("=" * 60)
 
     EPISODES = 2000
