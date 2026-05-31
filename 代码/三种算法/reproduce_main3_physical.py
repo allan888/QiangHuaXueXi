@@ -124,16 +124,20 @@ def compute_turn_arc(x, y, heading_idx, turn_action, radius, n_points=12):
         cy = y - radius * np.cos(theta)
         alpha_start = theta + np.pi / 2
         alpha_end = alpha_start - delta
+        end_angle = theta - delta
     else:
         cx = x - radius * np.sin(theta)
         cy = y + radius * np.cos(theta)
         alpha_start = theta - np.pi / 2
         alpha_end = alpha_start + delta
+        end_angle = theta + delta
 
     alphas = np.linspace(alpha_start, alpha_end, n_points)
     xs = cx + radius * np.cos(alphas)
     ys = cy + radius * np.sin(alphas)
-    return xs, ys
+    interp = np.linspace(0.0, 1.0, n_points)
+    headings = (1.0 - interp) * theta + interp * end_angle
+    return xs, ys, headings
 
 
 def compute_forward_line(x, y, heading_idx, n_points=15):
@@ -141,7 +145,8 @@ def compute_forward_line(x, y, heading_idx, n_points=15):
     dx, dy = np.cos(theta) * CELL_SIZE, np.sin(theta) * CELL_SIZE
     xs = np.linspace(x, x + dx, n_points)
     ys = np.linspace(y, y + dy, n_points)
-    return xs, ys
+    headings = np.full(n_points, theta)
+    return xs, ys, headings
 
 
 # ============================================================
@@ -252,29 +257,31 @@ class PhysicalUSV:
     def grid_pos(self):
         return pos_to_grid(self.x, self.y)
 
-    def _check_swept_collision(self, xs, ys, obstacles, occ_grid=None):
+    def _check_swept_collision(self, xs, ys, obstacles, occ_grid=None, headings=None):
         safe_l = self.length + 2 * SAFETY_MARGIN
         safe_w = self.width + 2 * SAFETY_MARGIN
+        if headings is None:
+            headings = np.full(len(xs), self.heading_angle)
         for i in range(len(xs)):
             cx, cy = xs[i], ys[i]
             if not point_in_world(cx, cy):
                 return True
             for obs in obstacles:
-                if obs.collides_with(cx, cy, safe_l, safe_w, self.heading_angle):
+                if obs.collides_with(cx, cy, safe_l, safe_w, headings[i]):
                     return True
         return False
 
     def _choose_turn_radius(self, turn_action, obstacles, occ_grid=None):
         candidates = np.linspace(self.max_radius, self.min_radius, 8)
         for R in candidates:
-            xs, ys = compute_turn_arc(self.x, self.y, self.heading_idx, turn_action, R)
-            if not self._check_swept_collision(xs, ys, obstacles, occ_grid):
+            xs, ys, headings = compute_turn_arc(self.x, self.y, self.heading_idx, turn_action, R)
+            if not self._check_swept_collision(xs, ys, obstacles, occ_grid, headings):
                 return R
         return None
 
     def move_forward(self, obstacles, occ_grid=None):
-        xs, ys = compute_forward_line(self.x, self.y, self.heading_idx)
-        if self._check_swept_collision(xs, ys, obstacles, occ_grid):
+        xs, ys, headings = compute_forward_line(self.x, self.y, self.heading_idx)
+        if self._check_swept_collision(xs, ys, obstacles, occ_grid, headings):
             return False
         self.x = xs[-1]
         self.y = ys[-1]
@@ -284,7 +291,7 @@ class PhysicalUSV:
         radius = self._choose_turn_radius(turn_action, obstacles, occ_grid)
         if radius is None:
             return False
-        xs, ys = compute_turn_arc(self.x, self.y, self.heading_idx, turn_action, radius)
+        xs, ys, headings = compute_turn_arc(self.x, self.y, self.heading_idx, turn_action, radius)
         self.x = xs[-1]
         self.y = ys[-1]
         if turn_action == TURN_LEFT:
@@ -295,15 +302,15 @@ class PhysicalUSV:
 
     def try_action(self, action, obstacles, occ_grid=None):
         if action == FORWARD:
-            xs, ys = compute_forward_line(self.x, self.y, self.heading_idx)
-            if self._check_swept_collision(xs, ys, obstacles, occ_grid):
+            xs, ys, headings = compute_forward_line(self.x, self.y, self.heading_idx)
+            if self._check_swept_collision(xs, ys, obstacles, occ_grid, headings):
                 return None
             return (xs[-1], ys[-1], self.heading_idx)
         else:
             radius = self._choose_turn_radius(action, obstacles, occ_grid)
             if radius is None:
                 return None
-            xs, ys = compute_turn_arc(self.x, self.y, self.heading_idx, action, radius)
+            xs, ys, headings = compute_turn_arc(self.x, self.y, self.heading_idx, action, radius)
             nh = (self.heading_idx + 1) % N_HEADINGS if action == TURN_LEFT else (self.heading_idx - 1) % N_HEADINGS
             return (xs[-1], ys[-1], nh)
 
@@ -347,6 +354,10 @@ class USVEnvironment:
             cx=600, cy=550, length=300, width=40, angle=0.0, is_static=True))
         obs.append(PhysicalObstacle(
             cx=800, cy=830, length=120, width=80, angle=0.0, is_static=True))
+        obs.append(PhysicalObstacle(
+            cx=130, cy=500, length=80, width=260, angle=0.0, is_static=True))
+        obs.append(PhysicalObstacle(
+            cx=180, cy=900, length=200, width=70, angle=0.0, is_static=True))
         return obs
 
     def _build_occ_grid(self):
@@ -371,13 +382,13 @@ class USVEnvironment:
         self.patrol_obstacles = []
 
         p1 = PatrolObstacle(
-            cx=300, cy=400, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=0.0,
-            waypoint_a=(200, 400), waypoint_b=(450, 400), speed=PATROL_SPEED)
+            cx=180, cy=300, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=0.0,
+            waypoint_a=(80, 300), waypoint_b=(280, 300), speed=PATROL_SPEED)
         self.patrol_obstacles.append(p1)
 
         p2 = PatrolObstacle(
-            cx=800, cy=650, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=0.0,
-            waypoint_a=(800, 580), waypoint_b=(800, 780), speed=PATROL_SPEED)
+            cx=350, cy=650, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=0.0,
+            waypoint_a=(350, 580), waypoint_b=(350, 780), speed=PATROL_SPEED)
         self.patrol_obstacles.append(p2)
 
     def _init_ambush_obstacles(self):
@@ -443,7 +454,13 @@ class USVEnvironment:
 
     def _move_patrol_obstacles(self):
         for pob in self.patrol_obstacles:
+            old_cx, old_cy = pob.cx, pob.cy
             pob.update()
+            for sob in self.static_obstacles:
+                if pob.collides_with(sob.cx, sob.cy, sob.length, sob.width, sob.angle):
+                    pob.cx, pob.cy = old_cx, old_cy
+                    pob.direction *= -1
+                    break
 
     def _check_detection(self):
         usx, usy = self.usv.x, self.usv.y
