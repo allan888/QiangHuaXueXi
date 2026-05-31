@@ -39,10 +39,10 @@ GRID_SIZE = int(WORLD_SIZE / CELL_SIZE)  # 100
 
 USV_LENGTH = 25.0
 USV_WIDTH = 8.0
-USV_MIN_RADIUS = 15.0
-USV_MAX_RADIUS = 60.0
+USV_MIN_RADIUS = 5.0
+USV_MAX_RADIUS = 15.0
 
-SAFETY_MARGIN = 5.0
+SAFETY_MARGIN = 10.0
 
 N_HEADINGS = 8
 HEADING_ANGLES = np.array([i * 2 * np.pi / N_HEADINGS for i in range(N_HEADINGS)])
@@ -173,6 +173,43 @@ class PhysicalObstacle:
         self.cy += dy
 
 
+class CircleObstacle:
+    """圆形障碍物模型"""
+    def __init__(self, cx, cy, radius, is_static=True):
+        self.cx = cx
+        self.cy = cy
+        self.radius = radius
+        self.length = radius * 2
+        self.width = radius * 2
+        self.angle = 0.0
+        self.is_static = is_static
+        self.is_circle = True
+
+    def collides_with(self, cx, cy, length, width, angle):
+        # 检验圆形与OBB（如USV）是否碰撞
+        # 1. 将圆心转换为OBB的局部坐标
+        dx = self.cx - cx
+        dy = self.cy - cy
+        cos_a = np.cos(angle)
+        sin_a = np.sin(angle)
+        local_x = dx * cos_a + dy * sin_a
+        local_y = -dx * sin_a + dy * cos_a
+        
+        # 2. 裁剪局部点到OBB边界
+        hl = length / 2.0
+        hw = width / 2.0
+        px = np.clip(local_x, -hl, hl)
+        py = np.clip(local_y, -hw, hw)
+        
+        # 3. 计算局部空间中的最短距离
+        dist = np.hypot(local_x - px, local_y - py)
+        return dist < self.radius
+
+    def move_by(self, dx, dy):
+        self.cx += dx
+        self.cy += dy
+
+
 class PatrolObstacle(PhysicalObstacle):
     """巡逻障碍物: 在两个航点间来回移动, 始终可探测"""
 
@@ -260,9 +297,10 @@ class PhysicalUSV:
     def _check_swept_collision(self, xs, ys, obstacles, occ_grid=None):
         safe_l = self.length + 2 * SAFETY_MARGIN
         safe_w = self.width + 2 * SAFETY_MARGIN
+        margin = max(safe_l, safe_w) / 2.0
         for i in range(len(xs)):
             cx, cy = xs[i], ys[i]
-            if not point_in_world(cx, cy):
+            if cx < margin or cx > WORLD_SIZE - margin or cy < margin or cy > WORLD_SIZE - margin:
                 return True
             for obs in obstacles:
                 if obs.collides_with(cx, cy, safe_l, safe_w, self.heading_angle):
@@ -270,7 +308,7 @@ class PhysicalUSV:
         return False
 
     def _choose_turn_radius(self, turn_action, obstacles, occ_grid=None):
-        candidates = np.linspace(self.max_radius, self.min_radius, 8)
+        candidates = np.linspace(self.min_radius, self.max_radius, 8)
         for R in candidates:
             xs, ys = compute_turn_arc(self.x, self.y, self.heading_idx, turn_action, R)
             if not self._check_swept_collision(xs, ys, obstacles, occ_grid):
@@ -329,9 +367,8 @@ class USVEnvironment:
         self.n_patrol = n_patrol
         self.n_ambush = n_ambush
 
-        max_dim = max(USV_LENGTH, USV_WIDTH) / 2 + CELL_SIZE
-        self.start = (max_dim, max_dim)
-        self.goal = (WORLD_SIZE - max_dim, WORLD_SIZE - max_dim)
+        self.start = (50.0, 50.0)
+        self.goal = (WORLD_SIZE - 50.0, WORLD_SIZE - 50.0)
         self.start_heading = 1
 
         self.usv = PhysicalUSV(*self.start, heading_idx=self.start_heading)
@@ -343,46 +380,81 @@ class USVEnvironment:
             self._init_patrol_obstacles()
         if n_ambush > 0:
             self._init_ambush_obstacles()
+        self.update_dist_map()
 
     def _build_static_obstacles(self):
+        """5个静态障碍物, 分散在全图, 明确固定为2个圆和3个矩形, 总面积占比约20.04% (200400/1000000)"""
+        configs = [
+            {"cx": 200, "cy": 800, "area": 40000, "L": 200, "W": 200, "shape": "circle"},
+            {"cx": 200, "cy": 200, "area": 39200, "L": 280, "W": 140, "shape": "rect"},
+            {"cx": 500, "cy": 500, "area": 36000, "L": 240, "W": 150, "shape": "circle"},
+            {"cx": 800, "cy": 800, "area": 42000, "L": 280, "W": 150, "shape": "rect"},
+            {"cx": 800, "cy": 200, "area": 43200, "L": 240, "W": 180, "shape": "rect"}
+        ]
         obs = []
-        obs.append(PhysicalObstacle(
-            cx=220, cy=180, length=160, width=60, angle=0.0, is_static=True))
-        obs.append(PhysicalObstacle(
-            cx=600, cy=550, length=300, width=40, angle=0.0, is_static=True))
-        obs.append(PhysicalObstacle(
-            cx=250, cy=800, length=120, width=80, angle=0.0, is_static=True))
+        for cfg in configs:
+            if cfg["shape"] == "circle":
+                # Area = pi * R^2 => R = sqrt(area / pi)
+                radius = np.sqrt(cfg["area"] / np.pi)
+                obs.append(CircleObstacle(cx=cfg["cx"], cy=cfg["cy"], radius=radius, is_static=True))
+            else:
+                obs.append(PhysicalObstacle(cx=cfg["cx"], cy=cfg["cy"], length=cfg["L"], width=cfg["W"], angle=0.0, is_static=True))
         return obs
 
     def _build_occ_grid(self):
         occ = np.zeros((GRID_SIZE, GRID_SIZE), dtype=bool)
+        # Expand obstacles by USV's physical size and safety margin to prevent narrow passages in dist_map
+        expansion = max(USV_LENGTH, USV_WIDTH) / 2.0 + SAFETY_MARGIN
+        margin_cells = int(np.floor(expansion / CELL_SIZE))
+        occ[0:margin_cells, :] = True
+        occ[-margin_cells:, :] = True
+        occ[:, 0:margin_cells] = True
+        occ[:, -margin_cells:] = True
+        
         for obs in self.static_obstacles:
-            corners = obb_corners(obs.cx, obs.cy, obs.length, obs.width, obs.angle)
-            gx_min = max(0, int(np.floor(np.min(corners[:, 0]) / CELL_SIZE)))
-            gx_max = min(GRID_SIZE - 1, int(np.ceil(np.max(corners[:, 0]) / CELL_SIZE)))
-            gy_min = max(0, int(np.floor(np.min(corners[:, 1]) / CELL_SIZE)))
-            gy_max = min(GRID_SIZE - 1, int(np.ceil(np.max(corners[:, 1]) / CELL_SIZE)))
-            for i in range(gx_min, gx_max + 1):
-                for j in range(gy_min, gy_max + 1):
-                    if occ[i, j]:
-                        continue
-                    gcx, gcy = grid_center(i, j)
-                    if obb_overlap((obs.cx, obs.cy), obs.length, obs.width, obs.angle,
-                                   (gcx, gcy), CELL_SIZE, CELL_SIZE, 0.0):
-                        occ[i, j] = True
+            if getattr(obs, 'is_circle', False):
+                eff_radius = obs.radius + expansion
+                gx_min = max(0, int(np.floor((obs.cx - eff_radius) / CELL_SIZE)))
+                gx_max = min(GRID_SIZE - 1, int(np.ceil((obs.cx + eff_radius) / CELL_SIZE)))
+                gy_min = max(0, int(np.floor((obs.cy - eff_radius) / CELL_SIZE)))
+                gy_max = min(GRID_SIZE - 1, int(np.ceil((obs.cy + eff_radius) / CELL_SIZE)))
+                for i in range(gx_min, gx_max + 1):
+                    for j in range(gy_min, gy_max + 1):
+                        if occ[i, j]:
+                            continue
+                        gcx, gcy = grid_center(i, j)
+                        dist = np.hypot(gcx - obs.cx, gcy - obs.cy)
+                        if dist < eff_radius + CELL_SIZE/2.0:
+                            occ[i, j] = True
+            else:
+                eff_length = obs.length + 2 * expansion
+                eff_width = obs.width + 2 * expansion
+                corners = obb_corners(obs.cx, obs.cy, eff_length, eff_width, obs.angle)
+                gx_min = max(0, int(np.floor(np.min(corners[:, 0]) / CELL_SIZE)))
+                gx_max = min(GRID_SIZE - 1, int(np.ceil(np.max(corners[:, 0]) / CELL_SIZE)))
+                gy_min = max(0, int(np.floor(np.min(corners[:, 1]) / CELL_SIZE)))
+                gy_max = min(GRID_SIZE - 1, int(np.ceil(np.max(corners[:, 1]) / CELL_SIZE)))
+                for i in range(gx_min, gx_max + 1):
+                    for j in range(gy_min, gy_max + 1):
+                        if occ[i, j]:
+                            continue
+                        gcx, gcy = grid_center(i, j)
+                        if obb_overlap((obs.cx, obs.cy), eff_length, eff_width, obs.angle,
+                                       (gcx, gcy), CELL_SIZE, CELL_SIZE, 0.0):
+                            occ[i, j] = True
         return occ
 
     def _init_patrol_obstacles(self):
         self.patrol_obstacles = []
 
         p1 = PatrolObstacle(
-            cx=325, cy=400, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=0.0,
-            waypoint_a=(200, 400), waypoint_b=(450, 400), speed=PATROL_SPEED)
+            cx=50, cy=400, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=np.pi / 2,
+            waypoint_a=(50, 200), waypoint_b=(50, 600), speed=PATROL_SPEED)
         self.patrol_obstacles.append(p1)
 
         p2 = PatrolObstacle(
-            cx=700, cy=425, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=np.pi / 2,
-            waypoint_a=(700, 300), waypoint_b=(700, 550), speed=PATROL_SPEED)
+            cx=920, cy=500, length=PATROL_OBS_LENGTH, width=PATROL_OBS_WIDTH, angle=np.pi / 2,
+            waypoint_a=(920, 300), waypoint_b=(920, 700), speed=PATROL_SPEED)
         self.patrol_obstacles.append(p2)
 
     def _init_ambush_obstacles(self):
@@ -450,14 +522,67 @@ class USVEnvironment:
         for pob in self.patrol_obstacles:
             pob.update()
 
+    def update_dist_map(self):
+        occ = np.copy(self._static_occ_grid)
+        expansion = max(USV_LENGTH, USV_WIDTH) / 2.0 + SAFETY_MARGIN
+        margin_cells = int(np.floor(expansion / CELL_SIZE))
+        occ[0:margin_cells, :] = True
+        occ[-margin_cells:, :] = True
+        occ[:, 0:margin_cells] = True
+        occ[:, -margin_cells:] = True
+
+        # Add detected ambushes to occ grid
+        for aob in self.ambush_obstacles:
+            if aob.detected:
+                eff_length = aob.length + 2 * expansion
+                eff_width = aob.width + 2 * expansion
+                corners = obb_corners(aob.cx, aob.cy, eff_length, eff_width, aob.angle)
+                gx_min = max(0, int(np.floor(np.min(corners[:, 0]) / CELL_SIZE)))
+                gx_max = min(GRID_SIZE - 1, int(np.ceil(np.max(corners[:, 0]) / CELL_SIZE)))
+                gy_min = max(0, int(np.floor(np.min(corners[:, 1]) / CELL_SIZE)))
+                gy_max = min(GRID_SIZE - 1, int(np.ceil(np.max(corners[:, 1]) / CELL_SIZE)))
+                for i in range(gx_min, gx_max + 1):
+                    for j in range(gy_min, gy_max + 1):
+                        if occ[i, j]: continue
+                        gcx, gcy = grid_center(i, j)
+                        if obb_overlap((aob.cx, aob.cy), eff_length, eff_width, aob.angle,
+                                       (gcx, gcy), CELL_SIZE, CELL_SIZE, 0.0):
+                            occ[i, j] = True
+
+        goal_gx, goal_gy = pos_to_grid(self.goal[0], self.goal[1])
+        dist = np.full((GRID_SIZE, GRID_SIZE), np.inf)
+        dist[goal_gx, goal_gy] = 0.0
+        q = deque([(goal_gx, goal_gy)])
+        while q:
+            x, y = q.popleft()
+            d = dist[x, y]
+            for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE and not occ[nx, ny]:
+                    cost = 1.414 if dx != 0 and dy != 0 else 1.0
+                    if dist[nx, ny] > d + cost:
+                        dist[nx, ny] = d + cost
+                        q.append((nx, ny))
+        self.dist_map = dist
+
     def _check_detection(self):
         usx, usy = self.usv.x, self.usv.y
+        new_detected = False
         for aob in self.ambush_obstacles:
-            aob.check_detection(usx, usy)
+            if not aob.detected:
+                if aob.check_detection(usx, usy):
+                    new_detected = True
+        if new_detected:
+            self.update_dist_map()
 
     def _check_detection_with_pos(self, x, y):
+        new_detected = False
         for aob in self.ambush_obstacles:
-            aob.check_detection(x, y)
+            if not aob.detected:
+                if aob.check_detection(x, y):
+                    new_detected = True
+        if new_detected:
+            self.update_dist_map()
 
     def get_visible_obstacles(self):
         visible = list(self.static_obstacles)
@@ -485,6 +610,7 @@ class USVEnvironment:
             self._init_patrol_obstacles()
         for aob in self.ambush_obstacles:
             aob.detected = False
+        self.update_dist_map()
         return self.state
 
     def step(self, action, move_patrol=True):
@@ -588,7 +714,8 @@ class QLearningBase:
             result = temp_usv.try_action(a, visible, occ)
             if result is not None:
                 nx, ny, nh = result
-                d = manhattan_dist_m((nx, ny), goal)
+                gx, gy = pos_to_grid(nx, ny)
+                d = self.env.dist_map[gx, gy] * CELL_SIZE + manhattan_dist_m((nx, ny), goal) * 0.001
                 candidates.append((a, d))
         candidates.sort(key=lambda x: x[1])
         return candidates
@@ -609,7 +736,8 @@ class QLearningBase:
                 distances.append(float('inf'))
             else:
                 nx, ny, nh = result
-                d = manhattan_dist_m((nx, ny), goal)
+                gx, gy = pos_to_grid(nx, ny)
+                d = self.env.dist_map[gx, gy] * CELL_SIZE + manhattan_dist_m((nx, ny), goal) * 0.001
                 distances.append(d)
 
         min_d = min(distances)
@@ -641,7 +769,7 @@ class QLearningBase:
             env_copy = USVEnvironment(
                 n_patrol=self.env.n_patrol,
                 n_ambush=0,
-                seed=42 + attempt * 100,
+                seed=42 + attempt,
             )
             env_copy.patrol_obstacles = [p.copy() for p in self.env.patrol_obstacles]
             for p in env_copy.patrol_obstacles:
@@ -656,6 +784,7 @@ class QLearningBase:
             path_points = [(env_copy.usv.x, env_copy.usv.y, env_copy.usv.heading_idx)]
             max_steps = GRID_SIZE * 10
             stuck_counter = 0
+            visited = {}
 
             for _ in range(max_steps):
                 if env_copy.is_at_goal():
@@ -672,7 +801,10 @@ class QLearningBase:
                     result = temp_usv.try_action(a, all_obs, occ)
                     if result is not None:
                         nx, ny, nh = result
-                        d = manhattan_dist_m((nx, ny), env_copy.goal)
+                        gx_pos, gy_pos = pos_to_grid(nx, ny)
+                        d = env_copy.dist_map[gx_pos, gy_pos] * CELL_SIZE + manhattan_dist_m((nx, ny), env_copy.goal) * 0.001
+                        gx_grid, gy_grid = pos_to_grid(nx, ny)
+                        d += visited.get((gx_grid, gy_grid, nh), 0) * 200.0
                         sdp_candidates.append((a, d))
 
                 if not sdp_candidates:
@@ -703,6 +835,11 @@ class QLearningBase:
                             break
                     if r < 0:
                         break
+                
+                gx, gy = env_copy.usv.grid_pos
+                nh = env_copy.usv.heading_idx
+                visited[(gx, gy, nh)] = visited.get((gx, gy, nh), 0) + 1
+                
                 path_points.append((env_copy.usv.x, env_copy.usv.y,
                                     env_copy.usv.heading_idx))
                 if done and r > 0:
@@ -735,6 +872,7 @@ class QLearningBase:
             path_points = [(env_copy.usv.x, env_copy.usv.y, env_copy.usv.heading_idx)]
             max_steps = GRID_SIZE * 8
             stuck_counter = 0
+            visited = {}
 
             for _ in range(max_steps):
                 if env_copy.is_at_goal():
@@ -752,7 +890,10 @@ class QLearningBase:
                     result = temp_usv.try_action(a, all_obs, occ)
                     if result is not None:
                         nx, ny, nh = result
-                        d = manhattan_dist_m((nx, ny), env_copy.goal)
+                        gx_pos, gy_pos = pos_to_grid(nx, ny)
+                        d = env_copy.dist_map[gx_pos, gy_pos] * CELL_SIZE + manhattan_dist_m((nx, ny), env_copy.goal) * 0.001
+                        gx_grid, gy_grid = pos_to_grid(nx, ny)
+                        d += visited.get((gx_grid, gy_grid, nh), 0) * 200.0
                         sdp_candidates.append((a, d))
 
                 if not sdp_candidates:
@@ -799,6 +940,10 @@ class QLearningBase:
                                 break
                         if r < 0:
                             break
+                        
+                gx, gy = env_copy.usv.grid_pos
+                nh = env_copy.usv.heading_idx
+                visited[(gx, gy, nh)] = visited.get((gx, gy, nh), 0) + 1
 
                 path_points.append((env_copy.usv.x, env_copy.usv.y,
                                     env_copy.usv.heading_idx))
@@ -1092,6 +1237,7 @@ class Alg5_DQN_SDP(QLearningBase):
             path_points = [(env_copy.usv.x, env_copy.usv.y, env_copy.usv.heading_idx)]
             max_steps = GRID_SIZE * 8
             stuck_counter = 0
+            visited = {}
 
             for _ in range(max_steps):
                 if env_copy.is_at_goal():
@@ -1109,7 +1255,10 @@ class Alg5_DQN_SDP(QLearningBase):
                     result = temp_usv.try_action(a, all_obs, occ)
                     if result is not None:
                         nx, ny, nh = result
-                        d = manhattan_dist_m((nx, ny), env_copy.goal)
+                        gx_pos, gy_pos = pos_to_grid(nx, ny)
+                        d = env_copy.dist_map[gx_pos, gy_pos] * CELL_SIZE + manhattan_dist_m((nx, ny), env_copy.goal) * 0.001
+                        gx_grid, gy_grid = pos_to_grid(nx, ny)
+                        d += visited.get((gx_grid, gy_grid, nh), 0) * 200.0
                         sdp_candidates.append((a, d))
 
                 if not sdp_candidates:
@@ -1156,6 +1305,10 @@ class Alg5_DQN_SDP(QLearningBase):
                                 break
                         if r < 0:
                             break
+                        
+                gx, gy = env_copy.usv.grid_pos
+                nh = env_copy.usv.heading_idx
+                visited[(gx, gy, nh)] = visited.get((gx, gy, nh), 0) + 1
 
                 path_points.append((env_copy.usv.x, env_copy.usv.y,
                                     env_copy.usv.heading_idx))
@@ -1297,8 +1450,12 @@ def plot_env(ax, env, title="Environment", show_patrol=True, show_ambush=True):
     ax.grid(True, alpha=0.2)
 
     for obs in env.static_obstacles:
-        draw_obb(ax, obs.cx, obs.cy, obs.length, obs.width, obs.angle,
-                 color=STATIC_COLOR, alpha=0.7, lw=1.5)
+        if getattr(obs, 'is_circle', False):
+            circle = plt.Circle((obs.cx, obs.cy), obs.radius, facecolor=STATIC_COLOR, edgecolor='black', linewidth=1.5, alpha=0.7)
+            ax.add_patch(circle)
+        else:
+            draw_obb(ax, obs.cx, obs.cy, obs.length, obs.width, obs.angle,
+                     color=STATIC_COLOR, alpha=0.7, lw=1.5)
 
     if show_patrol:
         for pob in env.patrol_obstacles:
@@ -1402,8 +1559,12 @@ def generate_path_gif(env, path_points, save_path, fps=8, show_detection=True):
         ax.grid(True, alpha=0.2)
 
         for obs in env_sim.static_obstacles:
-            draw_obb(ax, obs.cx, obs.cy, obs.length, obs.width, obs.angle,
-                     color=STATIC_COLOR, alpha=0.7, lw=1.5)
+            if getattr(obs, 'is_circle', False):
+                circle = plt.Circle((obs.cx, obs.cy), obs.radius, facecolor=STATIC_COLOR, edgecolor='black', linewidth=1.5, alpha=0.7)
+                ax.add_patch(circle)
+            else:
+                draw_obb(ax, obs.cx, obs.cy, obs.length, obs.width, obs.angle,
+                         color=STATIC_COLOR, alpha=0.7, lw=1.5)
 
         for pob in env_sim.patrol_obstacles:
             draw_obb(ax, pob.cx, pob.cy, pob.length, pob.width, pob.angle,
@@ -1510,7 +1671,7 @@ def main():
         print(f"        pip uninstall torch; pip install torch --index-url https://download.pytorch.org/whl/cu121")
     print("=" * 60)
 
-    EPISODES = 2000
+    EPISODES = 150
     SEED = 42
     N_PATROL = 2
 
